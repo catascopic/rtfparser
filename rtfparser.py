@@ -12,23 +12,27 @@ class Group:
 	def __init__(self, parent):
 		self.parent = parent
 		if parent is None:
-			self.dest = NullDest()
+			self.dest = Root()
 	
 	def control(self, word, param):
 		if word in ESCAPE:
 			self.dest.write(ESCAPE[word])
 		elif word == "'":
 			self.dest.write(param)
-		elif word in {'par', 'pard'}:
+		elif word == 'par':
 			self.dest.write('\n')
+		elif word == 'pard':
+			pass
 		elif word in FONT_FAMILIES:
 			self.family = word[1:]
-		elif word == 'fonttbl':
-			self.dest = font_table
 		elif word == 'rtf':
 			self.dest = output
-		elif word == '*':
-			pass  # MACRO
+		elif word == 'fonttbl':
+			self.dest = font_table
+		elif word == 'colortbl':
+			self.dest = color_table
+		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl', '*'}:
+			self.dest = NullDevice()
 		else:
 			setattr(self, word, param)
 
@@ -55,6 +59,7 @@ class Output(Destination):
 
 	def write(self, text):
 		self.full_text.append(text)
+		# print(text, end='')
 		
 
 @dataclass		
@@ -78,15 +83,32 @@ class FontTable(Destination):
 		self.fonts[group.f] = Font(name, group.family, group.charset)
 
 
+@dataclass		
+class Color:
+	red: int
+	green: int
+	blue: int
+
+
 class ColorTable(Destination):
-	pass
+	
+	def __init__(self):
+		self.colors = []
+
+	def write(self, text):
+		if text == ';':
+			self.colors.append(Color(group.red or 0, group.green or 0, group.blue or 0))
 
 
-class NullDest(Destination):
-
+class Root(Destination):
 	def write(self, text):
 		if text != '\x00':
 			raise ValueError(text.encode())
+
+
+class NullDevice(Destination):
+	def write(self, text):
+		pass  # do nothing
 
 
 ESCAPE = {
@@ -142,6 +164,7 @@ def read_control(f):
 
 output = Output()
 font_table = FontTable()
+color_table = ColorTable()
 group = Group(None)
 
 with open(file, 'rb') as f:
@@ -161,4 +184,5 @@ with open(file, 'rb') as f:
 
 
 print(font_table.fonts)
+print(color_table.colors)
 print(len(''.join(output.full_text)))
