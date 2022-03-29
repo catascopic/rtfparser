@@ -1,10 +1,15 @@
+import sys
+
 from pathlib import Path
 from dataclasses import dataclass
 from abc import ABC
+from enum import Enum
 
 
-file = Path('The Inner Searchlight.rtf')
-file = Path('test2.rtf')
+if len(sys.argv) > 1:
+	file = Path(sys.argv[1])
+else:
+	file = Path('test.rtf')
 
 
 class Group:
@@ -14,30 +19,8 @@ class Group:
 		if parent is None:
 			self.dest = Root()
 	
-	def control(self, word, param):
-		if word in ESCAPE:
-			self.write(ESCAPE[word])
-		elif word == 'par':
-			self.write('\n')
-		elif word == "'":
-			self.write(param)
-		elif word == 'pard':
-			pass
-		elif word == 'rtf':
-			self.dest = output
-		elif word == 'fonttbl':
-			self.dest = font_table
-		elif word == 'colortbl':
-			self.dest = color_table
-		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl', '*'}:
-			self.dest = NullDevice()
-		elif word in FONT_FAMILIES:
-			self.family = word[1:]
-		else:
-			setattr(self, word, param)
-	
 	def write(self, text):
-		self.dest.write(text)
+		(self.dest or self.parent).write(text, self)
 
 	# jesus christ this might not be worth it
 	def __getattr__(self, name):
@@ -48,7 +31,7 @@ class Group:
 
 class Destination(ABC):
 
-	def write(self, text):
+	def write(self, text, group):
 		return NotImplemented
 
 
@@ -57,12 +40,11 @@ class Output(Destination):
 	def __init__(self):
 		self.full_text = []
 
-	def write(self, text):
+	def write(self, text, group):
 		self.full_text.append(text)
-		# print(text, end='')
-		
 
-@dataclass		
+
+@dataclass
 class Font:
 	name: str
 	family: str
@@ -77,7 +59,7 @@ class FontTable(Destination):
 	def __init__(self):
 		self.fonts = {}
 
-	def write(self, text):
+	def write(self, text, group):
 		# should this be more rigorous?
 		name = text.removesuffix(';')
 		self.fonts[group.f] = Font(name, group.family, group.fcharset)
@@ -95,7 +77,7 @@ class ColorTable(Destination):
 	def __init__(self):
 		self.colors = []
 
-	def write(self, text):
+	def write(self, text, group):
 		if text == ';':
 			self.colors.append(Color(group.red or 0, group.green or 0, group.blue or 0))
 		else:
@@ -103,13 +85,13 @@ class ColorTable(Destination):
 
 
 class Root(Destination):
-	def write(self, text):
+	def write(self, text, group):
 		if text != '\x00':
 			raise ValueError(text.encode())
 
 
 class NullDevice(Destination):
-	def write(self, text):
+	def write(self, text, group):
 		pass  # do nothing
 
 
@@ -122,7 +104,8 @@ ESCAPE = {
 	'ldblquote': '“',
 	'rdblquote': '”',
 }
-
+TOGGLE = {'b', 'caps', 'i', 'outl', 'scaps', 'shad', 'strike', 'ul', 'v'}
+IGNORE_WORDS = {'nouicompat', 'viewkind'}
 SPECIAL = {b'\\', b'{', b'}'}
 
 
@@ -144,53 +127,94 @@ def read_until(f, matcher):
 			end = f.tell()
 			f.seek(start)
 			return f.read(end - start - len(c))
-	
 
-def read_control(f):
-	word = read_until(f, is_letter).decode()
-	if not word:
-		c = f.read(1)
-		if c == b'*':  # macro
-			return '*', None
-		# handle this better?
-		if c == b"'":
-			return "'", chr(int(f.read(2), 16))
-		if c in SPECIAL:
-			return "'", c.decode()
-		raise ValueError(c)
 
-	param = read_until(f, is_digit)
+def consume_end(f):
 	c = f.read(1)
 	if c == b'\r':
 		f.read(1)
 		# check that this next char is \n?
 	elif not c.isspace():
 		f.seek(-1, 1)
-	return word, int(param) if param else None
 
 
-output = Output()
-font_table = FontTable()
-color_table = ColorTable()
-group = Group(None)
+class RTF:
 
-with open(file, 'rb') as f:
-	while True:
-		text = read_until(f, not_control)
-		if text:
-			group.write(text.replace(b'\r\n', b'').decode())
-		c = f.read(1)
-		if c == b'{':
-			group = Group(group)
-		elif c == b'}':
-			group = group.parent
-		elif c == b'\\':
-			group.control(*read_control(f))
-		elif not c:
-			break
+	def __init__(self, file):
+		self.file = file
+		self.output = Output()
+		self.font_table = FontTable()
+		self.color_table = ColorTable()
+		self.group = Group(None)
 
+	def read_control(self, f):
+		word = read_until(f, is_letter).decode()
+		if word:
+			if word in ESCAPE:
+				self.write(ESCAPE[word])
+			else:
+				param = read_until(f, is_digit)
+				self.set_control(word, int(param) if param else None)
+			consume_end(f)
+		else:
+			c = f.read(1)
+			if c == b'*':
+				self.group.dest = NullDevice()
+			elif c == b"'":
+				self.write(chr(int(f.read(2), 16)))
+			elif c in SPECIAL:
+				self.write(c.decode())
+			else:
+				raise ValueError(c)
+	
+	def set_control(self, word, param):
+		if word == 'par' or word == 'line':
+			self.write('\n')
+		elif word == 'pard':
+			pass
+		elif word == 'rtf':
+			self.group.dest = self.output
+		elif word == 'fonttbl':
+			self.group.dest = self.font_table
+		elif word == 'colortbl':
+			self.group.dest = self.color_table
+		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl'}:
+			self.group.dest = NullDevice()
+		elif word in FONT_FAMILIES:
+			self.group.family = word[1:]
+		elif word in TOGGLE:
+			setattr(self.group, word, 1 if param is None else param)
+		elif word == 'ulnone':
+			self.group.ul = 0
+		elif word.startswith('ul'):
+			self.group.ul = word[2:]
+		elif word not in IGNORE_WORDS:
+			setattr(self.group, word, param)
+	
+	def write(self, text):
+		self.group.write(text)
 
-for font in font_table.fonts.values():
+	def parse(self):
+		with open(self.file, 'rb') as f:
+			while True:
+				text = read_until(f, not_control)
+				if text:
+					self.write(text.replace(b'\r\n', b'').decode())
+				c = f.read(1)
+				if c == b'{':
+					self.group = Group(self.group)
+				elif c == b'}':
+					self.group = self.group.parent
+				elif c == b'\\':
+					self.read_control(f)
+				elif not c:
+					break
+	
+	
+rtf = RTF(file)
+rtf.parse()
+
+for font in rtf.font_table.fonts.values():
 	print(font)
 # print(color_table.colors)
-print(len(''.join(output.full_text)))
+print(len(''.join(rtf.output.full_text)))
