@@ -4,7 +4,7 @@ from abc import ABC
 
 
 file = Path('The Inner Searchlight.rtf')
-# file = Path('test.rtf')
+file = Path('test2.rtf')
 
 
 class Group:
@@ -16,15 +16,13 @@ class Group:
 	
 	def control(self, word, param):
 		if word in ESCAPE:
-			self.dest.write(ESCAPE[word])
-		elif word == "'":
-			self.dest.write(param)
+			self.write(ESCAPE[word])
 		elif word == 'par':
-			self.dest.write('\n')
+			self.write('\n')
+		elif word == "'":
+			self.write(param)
 		elif word == 'pard':
 			pass
-		elif word in FONT_FAMILIES:
-			self.family = word[1:]
 		elif word == 'rtf':
 			self.dest = output
 		elif word == 'fonttbl':
@@ -33,8 +31,13 @@ class Group:
 			self.dest = color_table
 		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl', '*'}:
 			self.dest = NullDevice()
+		elif word in FONT_FAMILIES:
+			self.family = word[1:]
 		else:
 			setattr(self, word, param)
+	
+	def write(self, text):
+		self.dest.write(text)
 
 	# jesus christ this might not be worth it
 	def __getattr__(self, name):
@@ -47,10 +50,7 @@ class Destination(ABC):
 
 	def write(self, text):
 		return NotImplemented
-	
-	def control(self, word, param):
-		return NotImplemented
-			
+
 
 class Output(Destination):
 
@@ -80,7 +80,7 @@ class FontTable(Destination):
 	def write(self, text):
 		# should this be more rigorous?
 		name = text.removesuffix(';')
-		self.fonts[group.f] = Font(name, group.family, group.charset)
+		self.fonts[group.f] = Font(name, group.family, group.fcharset)
 
 
 @dataclass		
@@ -98,6 +98,8 @@ class ColorTable(Destination):
 	def write(self, text):
 		if text == ';':
 			self.colors.append(Color(group.red or 0, group.green or 0, group.blue or 0))
+		else:
+			raise ValueError(text)
 
 
 class Root(Destination):
@@ -121,6 +123,8 @@ ESCAPE = {
 	'rdblquote': '”',
 }
 
+SPECIAL = {b'\\', b'{', b'}'}
+
 
 def is_letter(c):
 	return b'a' <= c <= b'z' or b'A' <= c <= b'Z'
@@ -129,7 +133,7 @@ def is_digit(c):
 	return b'0' <= c <= b'9' or c == '-'
 
 def not_control(c):
-	return c not in {b'\\', b'{', b'}'}
+	return c not in SPECIAL
 
 
 def read_until(f, matcher):
@@ -148,8 +152,11 @@ def read_control(f):
 		c = f.read(1)
 		if c == b'*':  # macro
 			return '*', None
+		# handle this better?
 		if c == b"'":
 			return "'", chr(int(f.read(2), 16))
+		if c in SPECIAL:
+			return "'", c.decode()
 		raise ValueError(c)
 
 	param = read_until(f, is_digit)
@@ -169,9 +176,9 @@ group = Group(None)
 
 with open(file, 'rb') as f:
 	while True:
-		text = read_until(f, not_control).replace(b'\r\n', b'')
+		text = read_until(f, not_control)
 		if text:
-			group.dest.write(text.decode())
+			group.write(text.replace(b'\r\n', b'').decode())
 		c = f.read(1)
 		if c == b'{':
 			group = Group(group)
@@ -183,6 +190,7 @@ with open(file, 'rb') as f:
 			break
 
 
-print(font_table.fonts)
-print(color_table.colors)
+for font in font_table.fonts.values():
+	print(font)
+# print(color_table.colors)
 print(len(''.join(output.full_text)))
