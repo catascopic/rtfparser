@@ -1,9 +1,9 @@
+import re
 import sys
 
-from pathlib import Path
-from dataclasses import dataclass
 from abc import ABC
-from enum import Enum
+from dataclasses import dataclass
+from pathlib import Path
 
 
 if len(sys.argv) > 1:
@@ -20,7 +20,7 @@ class Group:
 			self.dest = Root()
 	
 	def write(self, text):
-		(self.dest or self.parent).write(text, self)
+		self.dest.write(text, self)
 
 	# jesus christ this might not be worth it
 	def __getattr__(self, name):
@@ -96,13 +96,14 @@ class NullDevice(Destination):
 
 
 ESCAPE = {
-	'tab': '\t',
-	'emdash': '—',
-	'endash': '-',
-	'lquote': '‘',
-	'rquote': '’',
+	'tab':       '\t',
+	'emdash':    '—',
+	'endash':    '-',
+	'lquote':    '‘',
+	'rquote':    '’',
 	'ldblquote': '“',
 	'rdblquote': '”',
+	'bullet':    '•',
 }
 TOGGLE = {'b', 'caps', 'i', 'outl', 'scaps', 'shad', 'strike', 'ul', 'v'}
 IGNORE_WORDS = {'nouicompat', 'viewkind'}
@@ -171,7 +172,13 @@ class RTF:
 		if word == 'par' or word == 'line':
 			self.write('\n')
 		elif word == 'pard':
-			pass
+			pass  # what does this reset exactly?
+		elif word in TOGGLE:
+			setattr(self.group, word, 1 if param is None else param)
+		elif word == 'ulnone':
+			self.group.ul = 0
+		elif word.startswith('ul'):
+			self.group.ul = word[2:]
 		elif word == 'rtf':
 			self.group.dest = self.output
 		elif word == 'fonttbl':
@@ -182,12 +189,6 @@ class RTF:
 			self.group.dest = NullDevice()
 		elif word in FONT_FAMILIES:
 			self.group.family = word[1:]
-		elif word in TOGGLE:
-			setattr(self.group, word, 1 if param is None else param)
-		elif word == 'ulnone':
-			self.group.ul = 0
-		elif word.startswith('ul'):
-			self.group.ul = word[2:]
 		elif word not in IGNORE_WORDS:
 			setattr(self.group, word, param)
 	
@@ -197,9 +198,9 @@ class RTF:
 	def parse(self):
 		with open(self.file, 'rb') as f:
 			while True:
-				text = read_until(f, not_control)
+				text = read_until(f, not_control).replace(b'\r\n', b'')
 				if text:
-					self.write(text.replace(b'\r\n', b'').decode())
+					self.write(text.decode())
 				c = f.read(1)
 				if c == b'{':
 					self.group = Group(self.group)
@@ -209,12 +210,15 @@ class RTF:
 					self.read_control(f)
 				elif not c:
 					break
-	
-	
+
+
 rtf = RTF(file)
 rtf.parse()
 
-for font in rtf.font_table.fonts.values():
-	print(font)
-# print(color_table.colors)
-print(len(''.join(rtf.output.full_text)))
+print({f.name for f in rtf.font_table.fonts.values()})
+full_text = ''.join(rtf.output.full_text)
+words = re.findall(r"\w[\w'‘’\-]*", full_text)
+print(f'words: {len(words)}, chars: {len(full_text)}')
+
+# from collections import Counter
+# print(Counter(w.lower() for w in words))
