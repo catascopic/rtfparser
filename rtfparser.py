@@ -22,6 +22,10 @@ class Group:
 	def write(self, text):
 		self.dest.write(text, self)
 
+	def reset(self, properties):
+		for name in properties:
+			self.__dict__.pop(name, None)
+
 	# jesus christ this might not be worth it
 	def __getattr__(self, name):
 		if self.parent is None:
@@ -95,6 +99,34 @@ class NullDevice(Destination):
 		pass  # do nothing
 
 
+CHARSETS = {'ansi', 'mac', 'pc', 'pca'}
+
+# Paragraph formatting (reset with \pard)
+PARFMT = {
+	's', 'hyphpar', 'intbl', 'keep', 'nowidctlpar', 'widctlpar', 
+	'keepn', 'level', 'noline', 'outlinelevel', 'pagebb', 'sbys',
+	# use q to keep track of alignment
+	'q',
+	# Indentation
+	'fi', 'li', 'ri',
+	# Spacing
+	'sb', 'sa', 'sl', 'slmult',
+	# Subdocuments
+	'subdocument',
+	# Bidirectional
+	'rtlpar', 'ltrpar',
+}
+
+# Character formatting (reset with \plain)
+TOGGLE = {'b', 'caps', 'deleted', 'i', 'outl',  'scaps', 'shad', 'strike', 'ul', 'v'}
+CHRFMT = {
+	'animtext', 'charscalex', 'dn', 'embo', 'impr', 'sub', 'nosupersub', 
+	'expnd', 'expndtw', 'kerning', 'f', 'fs', 'strikedl', 'up',
+	'super', 'cf', 'cb', 'rtlch', 'ltrch', 'cs', 'cchs', 'lang',
+} | TOGGLE
+
+# TABS = { ... }
+
 ESCAPE = {
 	'tab':       '\t',
 	'emdash':    '—',
@@ -105,8 +137,9 @@ ESCAPE = {
 	'rdblquote': '”',
 	'bullet':    '•',
 }
-TOGGLE = {'b', 'caps', 'i', 'outl', 'scaps', 'shad', 'strike', 'ul', 'v'}
+
 IGNORE_WORDS = {'nouicompat', 'viewkind'}
+
 SPECIAL = {b'\\', b'{', b'}'}
 
 
@@ -171,14 +204,18 @@ class RTF:
 	def set_control(self, word, param):
 		if word == 'par' or word == 'line':
 			self.write('\n')
-		elif word == 'pard':
-			pass  # what does this reset exactly?
 		elif word in TOGGLE:
 			setattr(self.group, word, 1 if param is None else param)
 		elif word == 'ulnone':
 			self.group.ul = 0
 		elif word.startswith('ul'):
 			self.group.ul = word[2:]
+		elif word.startswith('q'):  # alignment
+			self.group.q = word[1:]
+		elif word == 'pard':
+			self.group.reset(PARFMT)
+		elif word == 'plain':
+			self.group.reset(CHRFMT)
 		elif word == 'rtf':
 			self.group.dest = self.output
 		elif word == 'fonttbl':
