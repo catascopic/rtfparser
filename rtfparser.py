@@ -23,9 +23,9 @@ class Group:
 			self.dest = NullDevice()
 			self.prop = {}
 	
-	def write(self, text):
-		self.dest.write(text, self.prop)
-		
+	def write(self, text, doc):
+		self.dest.write(text, self.prop, doc)
+
 	def reset(self, properties):
 		for name in properties:
 			self.prop.pop(name, None)
@@ -33,7 +33,7 @@ class Group:
 
 class Destination(ABC):
 
-	def write(self, text, group):
+	def write(self, text, group, doc):
 		return NotImplemented
 
 
@@ -42,8 +42,9 @@ class Output(Destination):
 	def __init__(self):
 		self.full_text = []
 
-	def write(self, text, prop):
+	def write(self, text, prop, doc):
 		self.full_text.append(text)
+		print(prop, text)
 
 
 @dataclass
@@ -61,7 +62,7 @@ class FontTable(Destination):
 	def __init__(self):
 		self.fonts = {}
 
-	def write(self, text, prop):
+	def write(self, text, prop, doc):
 		# should this be more rigorous?
 		name = text.removesuffix(';')
 		self.fonts[prop['f']] = Font(name, prop['family'], prop.get('fcharset'))
@@ -79,7 +80,7 @@ class ColorTable(Destination):
 	def __init__(self):
 		self.colors = []
 
-	def write(self, text, prop):
+	def write(self, text, prop, doc):
 		if text == ';':
 			self.colors.append(Color(
 				prop.get('red', 0),
@@ -90,7 +91,7 @@ class ColorTable(Destination):
 
 
 class NullDevice(Destination):
-	def write(self, text, prop):
+	def write(self, text, prop, doc):
 		pass  # do nothing
 
 
@@ -167,7 +168,7 @@ def consume_end(f):
 		f.seek(-1, 1)
 
 
-class RTF:
+class Parser:
 
 	def __init__(self, file):
 		self.file = file
@@ -175,6 +176,8 @@ class RTF:
 		self.font_table = FontTable()
 		self.color_table = ColorTable()
 		self.group = Group()
+		self.charset = 'ansi'
+		self.deff = None
 
 	def read_control(self, f):
 		word = read_until(f, is_letter).decode()
@@ -183,7 +186,7 @@ class RTF:
 				self.write(ESCAPE[word])
 			else:
 				param = read_until(f, is_digit)
-				self.set_control(word, int(param) if param else None)
+				self.control(word, int(param) if param else None)
 			consume_end(f)
 		else:
 			c = f.read(1)
@@ -196,36 +199,41 @@ class RTF:
 			else:
 				raise ValueError(c)
 	
-	def set_control(self, word, param):
+	def control(self, word, param):
+		group = self.group
 		if word == 'par' or word == 'line':
 			self.write('\n')
 		elif word in TOGGLE:
-			self.group.prop[word] = 1 if param is None else param
+			group.prop[word] = 1 if param is None else param
 		elif word == 'ulnone':
-			self.group.prop['ul'] = 0
+			group.prop['ul'] = 0
 		elif word.startswith('ul'):
-			self.group.prop['ul'] = word[2:]
+			group.prop['ul'] = word[2:]
 		elif word.startswith('q'):  # alignment
-			self.group.prop['q'] = word[1:]
+			group.prop['q'] = word[1:]
 		elif word == 'pard':
-			self.group.reset(PARFMT)
+			group.reset(PARFMT)
 		elif word == 'plain':
-			self.group.reset(CHRFMT)
+			group.reset(CHRFMT)
 		elif word == 'rtf':
-			self.group.dest = self.output
+			group.dest = self.output
 		elif word == 'fonttbl':
-			self.group.dest = self.font_table
+			group.dest = self.font_table
 		elif word == 'colortbl':
-			self.group.dest = self.color_table
+			group.dest = self.color_table
 		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl'}:
-			self.group.dest = NullDevice()
+			group.dest = NullDevice()
+		elif word in CHARSETS:
+			self.charset = word
+		elif word == 'deff':
+			self.deff = param
 		elif word in FONT_FAMILIES:
-			self.group.prop['family'] = word[1:]
+			group.prop['family'] = word[1:]
 		elif word not in IGNORE_WORDS:
-			self.group.prop[word] = param
+			group.prop[word] = param
 	
 	def write(self, text):
-		self.group.write(text)
+		self.group.write(text, self)
 
 	def parse(self):
 		with open(self.file, 'rb') as f:
@@ -244,7 +252,7 @@ class RTF:
 					break
 
 
-rtf = RTF(file)
+rtf = Parser(file)
 rtf.parse()
 
 print({f.name for f in rtf.font_table.fonts.values()})
