@@ -14,23 +14,21 @@ else:
 
 class Group:
 
-	def __init__(self, parent):
+	def __init__(self, parent=None):
 		self.parent = parent
-		if parent is None:
-			self.dest = Root()
+		if parent:
+			self.dest = parent.dest
+			self.prop = parent.prop.copy()
+		else:
+			self.dest = NullDevice()
+			self.prop = {}
 	
 	def write(self, text):
-		self.dest.write(text, self)
-
+		self.dest.write(text, self.prop)
+		
 	def reset(self, properties):
 		for name in properties:
-			self.__dict__.pop(name, None)
-
-	# jesus christ this might not be worth it
-	def __getattr__(self, name):
-		if self.parent is None:
-			return None
-		return getattr(self.parent, name)
+			self.prop.pop(name, None)
 
 
 class Destination(ABC):
@@ -44,7 +42,7 @@ class Output(Destination):
 	def __init__(self):
 		self.full_text = []
 
-	def write(self, text, group):
+	def write(self, text, prop):
 		self.full_text.append(text)
 
 
@@ -63,10 +61,10 @@ class FontTable(Destination):
 	def __init__(self):
 		self.fonts = {}
 
-	def write(self, text, group):
+	def write(self, text, prop):
 		# should this be more rigorous?
 		name = text.removesuffix(';')
-		self.fonts[group.f] = Font(name, group.family, group.fcharset)
+		self.fonts[prop['f']] = Font(name, prop['family'], prop.get('fcharset'))
 
 
 @dataclass		
@@ -81,21 +79,18 @@ class ColorTable(Destination):
 	def __init__(self):
 		self.colors = []
 
-	def write(self, text, group):
+	def write(self, text, prop):
 		if text == ';':
-			self.colors.append(Color(group.red or 0, group.green or 0, group.blue or 0))
+			self.colors.append(Color(
+				prop.get('red', 0),
+				prop.get('green', 0),
+				prop.get('blue', 0)))
 		else:
 			raise ValueError(text)
 
 
-class Root(Destination):
-	def write(self, text, group):
-		if text != '\x00':
-			raise ValueError(text.encode())
-
-
 class NullDevice(Destination):
-	def write(self, text, group):
+	def write(self, text, prop):
 		pass  # do nothing
 
 
@@ -179,7 +174,7 @@ class RTF:
 		self.output = Output()
 		self.font_table = FontTable()
 		self.color_table = ColorTable()
-		self.group = Group(None)
+		self.group = Group()
 
 	def read_control(self, f):
 		word = read_until(f, is_letter).decode()
@@ -205,13 +200,13 @@ class RTF:
 		if word == 'par' or word == 'line':
 			self.write('\n')
 		elif word in TOGGLE:
-			setattr(self.group, word, 1 if param is None else param)
+			self.group.prop[word] = 1 if param is None else param
 		elif word == 'ulnone':
-			self.group.ul = 0
+			self.group.prop['ul'] = 0
 		elif word.startswith('ul'):
-			self.group.ul = word[2:]
+			self.group.prop['ul'] = word[2:]
 		elif word.startswith('q'):  # alignment
-			self.group.q = word[1:]
+			self.group.prop['q'] = word[1:]
 		elif word == 'pard':
 			self.group.reset(PARFMT)
 		elif word == 'plain':
@@ -225,9 +220,9 @@ class RTF:
 		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl'}:
 			self.group.dest = NullDevice()
 		elif word in FONT_FAMILIES:
-			self.group.family = word[1:]
+			self.group.prop['family'] = word[1:]
 		elif word not in IGNORE_WORDS:
-			setattr(self.group, word, param)
+			self.group.prop[word] = param
 	
 	def write(self, text):
 		self.group.write(text)
