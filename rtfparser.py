@@ -3,6 +3,7 @@ import sys
 
 from abc import ABC
 from dataclasses import dataclass
+from collections import defaultdict, Counter
 from pathlib import Path
 
 
@@ -25,6 +26,12 @@ class Group:
 	
 	def write(self, text, doc):
 		self.dest.write(text, self.prop, doc)
+		
+	def toggle(self, word, param):
+		if param == 0:
+			self.prop.pop(word, None)
+		else:
+			self.prop[word] = True if param is None else param
 
 	def reset(self, properties):
 		for name in properties:
@@ -41,10 +48,20 @@ class Output(Destination):
 
 	def __init__(self):
 		self.full_text = []
+		self.lastprop = {}
+		self.count = Counter()
 
 	def write(self, text, prop, doc):
 		self.full_text.append(text)
-		print(prop, text)
+		if not text.isspace():
+			if prop['f'] == 1 and prop['fs'] == 36 and prop.get('q', 'l') == 'c':
+				print(self.full_text[-5:])
+			self.count[frozenset(prop.items())] += len(text)
+			if prop != self.lastprop:
+				diff = {k: (self.lastprop.get(k), prop.get(k)) for k in (prop.keys() | self.lastprop.keys())
+						if self.lastprop.get(k) != prop.get(k)}
+				# print(diff, text)
+				self.lastprop = prop.copy()
 
 
 @dataclass
@@ -61,11 +78,14 @@ class FontTable(Destination):
 
 	def __init__(self):
 		self.fonts = {}
+		self.name = None
 
 	def write(self, text, prop, doc):
-		# should this be more rigorous?
-		name = text.removesuffix(';')
-		self.fonts[prop['f']] = Font(name, prop['family'], prop.get('fcharset'))
+		if text.endswith(';'):
+			name = self.name if text == ';' else text[:-1]
+			self.fonts[prop['f']] = Font(name, prop['family'], prop.get('fcharset'))
+		else:
+			self.name = text
 
 
 @dataclass		
@@ -114,7 +134,7 @@ PARFMT = {
 }
 
 # Character formatting (reset with \plain)
-TOGGLE = {'b', 'caps', 'deleted', 'i', 'outl',  'scaps', 'shad', 'strike', 'ul', 'v'}
+TOGGLE = {'b', 'caps', 'deleted', 'i', 'outl', 'scaps', 'shad', 'strike', 'ul', 'v'}
 CHRFMT = {
 	'animtext', 'charscalex', 'dn', 'embo', 'impr', 'sub', 'nosupersub', 
 	'expnd', 'expndtw', 'kerning', 'f', 'fs', 'strikedl', 'up',
@@ -168,6 +188,14 @@ def consume_end(f):
 		f.seek(-1, 1)
 
 
+def skip_char(f):
+	c = f.read(1)
+	if c == b'\\':
+		if f.read(1) != b"'":
+			raise ValueError()
+		f.read(2)
+
+
 class Parser:
 
 	def __init__(self, file):
@@ -186,14 +214,19 @@ class Parser:
 				self.write(ESCAPE[word])
 			else:
 				param = read_until(f, is_digit)
-				self.control(word, int(param) if param else None)
+				param = int(param) if param else None
+				if word == 'u':
+					self.write(chr(param))
+					skip_char(f)
+				else:
+					self.control(word, param)
 			consume_end(f)
 		else:
 			c = f.read(1)
 			if c == b'*':
 				self.group.dest = NullDevice()
 			elif c == b"'":
-				self.write(chr(int(f.read(2), 16)))
+				self.write(bytes([int(f.read(2), 16)]).decode('ansi'))
 			elif c in SPECIAL:
 				self.write(c.decode())
 			else:
@@ -204,17 +237,20 @@ class Parser:
 		if word == 'par' or word == 'line':
 			self.write('\n')
 		elif word in TOGGLE:
-			group.prop[word] = 1 if param is None else param
-		elif word == 'ulnone':
-			group.prop['ul'] = 0
-		elif word.startswith('ul'):
-			group.prop['ul'] = word[2:]
+			group.toggle(word, param)
+		elif word == 'ql':
+			group.prop.pop('q', None)
 		elif word.startswith('q'):  # alignment
 			group.prop['q'] = word[1:]
+		elif word == 'ulnone':
+			group.prop.pop('ul', None)
+		elif word.startswith('ul'):
+			group.prop['ul'] = word[2:]
 		elif word == 'pard':
 			group.reset(PARFMT)
 		elif word == 'plain':
 			group.reset(CHRFMT)
+			group.prop['f'] = self.deff
 		elif word == 'rtf':
 			group.dest = self.output
 		elif word == 'fonttbl':
@@ -226,11 +262,11 @@ class Parser:
 		elif word in CHARSETS:
 			self.charset = word
 		elif word == 'deff':
-			self.deff = param
+			self.deff = group.prop['f'] = param
 		elif word in FONT_FAMILIES:
 			group.prop['family'] = word[1:]
 		elif word not in IGNORE_WORDS:
-			group.prop[word] = param
+			group.prop[word] = param			
 	
 	def write(self, text):
 		self.group.write(text, self)
@@ -255,10 +291,14 @@ class Parser:
 rtf = Parser(file)
 rtf.parse()
 
-print({f.name for f in rtf.font_table.fonts.values()})
+print([f.name for f in rtf.font_table.fonts.values()])
 full_text = ''.join(rtf.output.full_text)
 words = re.findall(r"\w[\w'‘’\-]*", full_text)
 print(f'words: {len(words)}, chars: {len(full_text)}')
 
 # from collections import Counter
 # print(Counter(w.lower() for w in words))
+shared = set.intersection(*(set(s) for s in rtf.output.count.keys()))
+# print('shared:', shared)
+for k, v in sorted(rtf.output.count.items(), key=lambda a: a[1]):
+	print(f'{v:6}: {sorted(k - shared)}')
