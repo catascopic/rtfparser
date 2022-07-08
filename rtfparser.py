@@ -42,6 +42,12 @@ class Destination(ABC):
 
 	def write(self, text, group, doc):
 		return NotImplemented
+		
+	def par(self, group, doc):
+		raise ValueError
+		
+	def line(self, group, doc):
+		raise ValueError
 
 
 class Output(Destination):
@@ -62,6 +68,12 @@ class Output(Destination):
 						if self.lastprop.get(k) != prop.get(k)}
 				# print(diff, text)
 				self.lastprop = prop.copy()
+	
+	def par(self, group, doc):
+		self.write('\n', group, doc)
+	
+	def line(self, group, doc):
+		self.par(group, doc)
 
 
 @dataclass
@@ -69,23 +81,22 @@ class Font:
 	name: str
 	family: str
 	charset: str
-	
 
-FONT_FAMILIES = {'fnil', 'froman', 'fswiss', 'fmodern', 
-                 'fscript', 'fdecor', 'ftech', 'fbidi'}
 
 class FontTable(Destination):
 
 	def __init__(self):
 		self.fonts = {}
-		self.name = None
+		self.name = []
 
 	def write(self, text, prop, doc):
-		if text.endswith(';'):
-			name = self.name if text == ';' else text[:-1]
-			self.fonts[prop['f']] = Font(name, prop['family'], prop.get('fcharset'))
-		else:
-			self.name = text
+		self.name.append(text)
+		if text.endswith(';'):	
+			self.fonts[prop['f']] = Font(
+				''.join(self.name)[:-1], 
+				prop['family'], 
+				prop.get('fcharset'))
+			self.name = []
 
 
 @dataclass		
@@ -116,7 +127,10 @@ class NullDevice(Destination):
 
 
 CHARSETS = {'ansi', 'mac', 'pc', 'pca'}
-
+FONT_FAMILIES = {
+	'fnil', 'froman', 'fswiss', 'fmodern', 
+	'fscript', 'fdecor', 'ftech', 'fbidi'
+}
 # Paragraph formatting (reset with \pard)
 PARFMT = {
 	's', 'hyphpar', 'intbl', 'keep', 'nowidctlpar', 'widctlpar', 
@@ -169,7 +183,7 @@ def not_control(c):
 	return c not in SPECIAL
 
 
-def read_until(f, matcher):
+def read_while(f, matcher):
 	start = f.tell()
 	while True:
 		c = f.read(1)
@@ -188,12 +202,13 @@ def consume_end(f):
 		f.seek(-1, 1)
 
 
-def skip_char(f):
-	c = f.read(1)
-	if c == b'\\':
-		if f.read(1) != b"'":
-			raise ValueError()
-		f.read(2)
+def skip_chars(f, n=1):
+	for _ in range(n):
+		c = f.read(1)
+		if c == b'\\':
+			read_while(f, is_letter)
+			read_while(f, is_digit)
+			consume_end(f)
 
 
 class Parser:
@@ -208,18 +223,20 @@ class Parser:
 		self.deff = None
 
 	def read_control(self, f):
-		word = read_until(f, is_letter).decode()
+		word = read_while(f, is_letter).decode()
 		if word:
 			if word in ESCAPE:
 				self.write(ESCAPE[word])
 			else:
-				param = read_until(f, is_digit)
+				param = read_while(f, is_digit)
 				param = int(param) if param else None
 				if word == 'u':
+					# we can always handle unicode
 					self.write(chr(param))
-					skip_char(f)
-				else:
-					self.control(word, param)
+					skip_chars(f, group.prop.get('uc', 1))
+					# don't do consume_end
+					return
+				self.control(word, param)
 			consume_end(f)
 		else:
 			c = f.read(1)
@@ -229,13 +246,15 @@ class Parser:
 				self.write(bytes([int(f.read(2), 16)]).decode('ansi'))
 			elif c in SPECIAL:
 				self.write(c.decode())
-			else:
+			elif c not in {b'~', b'-', b'_', b':'}:  # ignore these?
 				raise ValueError(c)
-	
+
 	def control(self, word, param):
 		group = self.group
-		if word == 'par' or word == 'line':
-			self.write('\n')
+		if word == 'par':
+			self.group.dest.par(self.group, self)
+		elif word == 'line':
+			self.group.dest.line(self.group, self)
 		elif word in TOGGLE:
 			group.toggle(word, param)
 		elif word == 'ql':
@@ -251,6 +270,7 @@ class Parser:
 		elif word == 'plain':
 			group.reset(CHRFMT)
 			group.prop['f'] = self.deff
+			# use actual font obj?
 		elif word == 'rtf':
 			group.dest = self.output
 		elif word == 'fonttbl':
@@ -274,7 +294,7 @@ class Parser:
 	def parse(self):
 		with open(self.file, 'rb') as f:
 			while True:
-				text = read_until(f, not_control).replace(b'\r\n', b'')
+				text = read_while(f, not_control).replace(b'\r\n', b'')
 				if text:
 					self.write(text.decode())
 				c = f.read(1)
@@ -286,19 +306,37 @@ class Parser:
 					self.read_control(f)
 				elif not c:
 					break
+	
+	@property
+	def prop():
+		return group.prop
+
+	def font():
+		return self.font_table[self.prop['f']]
 
 
 rtf = Parser(file)
 rtf.parse()
 
-print([f.name for f in rtf.font_table.fonts.values()])
+
+# print([f.name for f in rtf.font_table.fonts.values()])
 full_text = ''.join(rtf.output.full_text)
-words = re.findall(r"\w[\w'‘’\-]*", full_text)
+# (?:[^\W_]|['‘’\-])
+WORDS = re.compile(r"[^\W_][\w'‘’\-]*")
+words = WORDS.findall(full_text)
+print(' '.join([w for w, c in Counter(w.lower().strip("'‘’") for w in words).items() if c == 1][-24:]))
+# print(sorted(Counter(w.lower().strip("'‘’") for w in words).items(), key=lambda x: -x[1])[128:256])
 print(f'words: {len(words)}, chars: {len(full_text)}')
+mark = full_text.rfind('^')
+if mark != -1:
+	print('since mark:', len(WORDS.findall(full_text[mark + 1:])))
+
+bad_quote_words = re.findall(r"\S+['\"]\S+", full_text)
+if bad_quote_words:
+	print('BAD QUOTES:', ' '.join(bad_quote_words))
 
 # from collections import Counter
-# print(Counter(w.lower() for w in words))
-shared = set.intersection(*(set(s) for s in rtf.output.count.keys()))
+# shared = set.intersection(*(set(s) for s in rtf.output.count.keys()))
 # print('shared:', shared)
-for k, v in sorted(rtf.output.count.items(), key=lambda a: a[1]):
-	print(f'{v:6}: {sorted(k - shared)}')
+# for k, v in sorted(rtf.output.count.items(), key=lambda a: a[1]):
+	# print(f'{v:6}: {sorted(k - shared)}')
