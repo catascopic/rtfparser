@@ -3,7 +3,7 @@ import sys
 
 from abc import ABC
 from dataclasses import dataclass
-from collections import defaultdict, Counter
+from collections import Counter
 from pathlib import Path
 
 
@@ -48,6 +48,15 @@ class Destination(ABC):
 		
 	def line(self, group, doc):
 		raise ValueError
+
+	def nbsp(self, group, doc):
+		self.write(u'\u00A0', group, doc)
+
+	def opt_hyphen(self, group, doc):
+		self.write(u'\u00AD', group, doc)
+
+	def nb_hyphen(self, group, doc):
+		self.write(u'\u2011', group, doc)
 
 
 class Output(Destination):
@@ -176,8 +185,10 @@ SPECIAL = {b'\\', b'{', b'}'}
 def is_letter(c):
 	return b'a' <= c <= b'z' or b'A' <= c <= b'Z'
 
+
 def is_digit(c):
 	return b'0' <= c <= b'9' or c == '-'
+
 
 def not_control(c):
 	return c not in SPECIAL
@@ -229,11 +240,11 @@ class Parser:
 				self.write(ESCAPE[word])
 			else:
 				param = read_while(f, is_digit)
-				param = int(param) if param else None
+				param = int(param) if param else None  # can we make the default True?
 				if word == 'u':
 					# we can always handle unicode
 					self.write(chr(param))
-					skip_chars(f, group.prop.get('uc', 1))
+					skip_chars(f, self.group.prop.get('uc', 1))
 					# don't do consume_end
 					return
 				self.control(word, param)
@@ -246,15 +257,23 @@ class Parser:
 				self.write(bytes([int(f.read(2), 16)]).decode('ansi'))
 			elif c in SPECIAL:
 				self.write(c.decode())
-			elif c not in {b'~', b'-', b'_', b':'}:  # ignore these?
+			elif c == b'~':
+				self.group.dest.nbsp(self.group, self)
+			elif c == b'-':
+				self.group.dest.opt_hyphen(self.group, self)
+			elif c == b'_':
+				self.group.dest.nb_hyphen(self.group, self)
+			elif c == b':':
+				raise ValueError('subentry')
+			else:
 				raise ValueError(c)
 
 	def control(self, word, param):
 		group = self.group
 		if word == 'par':
-			self.group.dest.par(self.group, self)
+			group.dest.par(group, self)
 		elif word == 'line':
-			self.group.dest.line(self.group, self)
+			group.dest.line(group, self)
 		elif word in TOGGLE:
 			group.toggle(word, param)
 		elif word == 'ql':
@@ -308,11 +327,11 @@ class Parser:
 					break
 	
 	@property
-	def prop():
-		return group.prop
+	def prop(self):
+		return self.group.prop
 
-	def font():
-		return self.font_table[self.prop['f']]
+	def font(self):
+		return self.font_table.fonts[self.prop['f']]
 
 
 rtf = Parser(file)
