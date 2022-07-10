@@ -23,66 +23,33 @@ class Group:
 		else:
 			self.dest = NullDevice()
 			self.prop = {}
-	
-	def write(self, text, doc):
-		self.dest.write(text, self.prop, doc)
-		
-	def toggle(self, word, param):
-		if param == 0:
-			self.prop.pop(word, None)
-		else:
-			self.prop[word] = True if param is None else param
-
-	def reset(self, properties):
-		for name in properties:
-			self.prop.pop(name, None)
 
 
 class Destination(ABC):
 
-	def write(self, text, group, doc):
+	def write(self, text):
 		return NotImplemented
-		
-	def par(self, group, doc):
-		raise ValueError
-		
-	def line(self, group, doc):
-		raise ValueError
 
-	def nbsp(self, group, doc):
-		self.write(u'\u00A0', group, doc)
+	def par(self):
+		self.write('\n')
 
-	def opt_hyphen(self, group, doc):
-		self.write(u'\u00AD', group, doc)
+	def line(self):
+		self.par()
 
-	def nb_hyphen(self, group, doc):
-		self.write(u'\u2011', group, doc)
+	def nbsp(self):
+		self.write(u'\u00A0')
+
+	def opt_hyphen(self):
+		self.write(u'\u00AD')
+
+	def nb_hyphen(self):
+		self.write(u'\u2011')
 
 
 class Output(Destination):
 
-	def __init__(self):
-		self.full_text = []
-		self.lastprop = {}
-		self.count = Counter()
-
-	def write(self, text, prop, doc):
-		self.full_text.append(text)
-		if not text.isspace():
-			if prop['f'] == 1 and prop['fs'] == 36 and prop.get('q', 'l') == 'c':
-				print(self.full_text[-5:])
-			self.count[frozenset(prop.items())] += len(text)
-			if prop != self.lastprop:
-				diff = {k: (self.lastprop.get(k), prop.get(k)) for k in (prop.keys() | self.lastprop.keys())
-						if self.lastprop.get(k) != prop.get(k)}
-				# print(diff, text)
-				self.lastprop = prop.copy()
-	
-	def par(self, group, doc):
-		self.write('\n', group, doc)
-	
-	def line(self, group, doc):
-		self.par(group, doc)
+	def __init__(self, doc):
+		self.doc = doc
 
 
 @dataclass
@@ -94,17 +61,18 @@ class Font:
 
 class FontTable(Destination):
 
-	def __init__(self):
+	def __init__(self, doc):
+		self.doc = doc
 		self.fonts = {}
 		self.name = []
 
-	def write(self, text, prop, doc):
+	def write(self, text):
 		self.name.append(text)
 		if text.endswith(';'):	
-			self.fonts[prop['f']] = Font(
+			self.fonts[self.doc.prop['f']] = Font(
 				''.join(self.name)[:-1], 
-				prop['family'], 
-				prop.get('fcharset'))
+				self.doc.prop['family'],
+				self.doc.prop.get('fcharset'))
 			self.name = []
 
 
@@ -115,23 +83,27 @@ class Color:
 	blue: int
 
 
+BLACK = Color(0, 0, 0)
+
+
 class ColorTable(Destination):
 	
-	def __init__(self):
+	def __init__(self, doc):
+		self.doc = doc
 		self.colors = []
 
-	def write(self, text, prop, doc):
+	def write(self, text):
 		if text == ';':
 			self.colors.append(Color(
-				prop.get('red', 0),
-				prop.get('green', 0),
-				prop.get('blue', 0)))
+				self.doc.prop.get('red', 0),
+				self.doc.prop.get('green', 0),
+				self.doc.prop.get('blue', 0)))
 		else:
 			raise ValueError(text)
 
 
 class NullDevice(Destination):
-	def write(self, text, prop, doc):
+	def write(self, text):
 		pass  # do nothing
 
 
@@ -224,98 +196,20 @@ def skip_chars(f, n=1):
 
 class Parser:
 
-	def __init__(self, file):
-		self.file = file
-		self.output = Output()
-		self.font_table = FontTable()
-		self.color_table = ColorTable()
+	def __init__(self, output):
+		self.output = output(self)
+		self.font_table = FontTable(self)
+		self.color_table = ColorTable(self)
 		self.group = Group()
 		self.charset = 'ansi'
 		self.deff = None
 
-	def read_control(self, f):
-		word = read_while(f, is_letter).decode()
-		if word:
-			if word in ESCAPE:
-				self.write(ESCAPE[word])
-			else:
-				param = read_while(f, is_digit)
-				param = int(param) if param else None  # can we make the default True?
-				if word == 'u':
-					# we can always handle unicode
-					self.write(chr(param))
-					skip_chars(f, self.group.prop.get('uc', 1))
-					# don't do consume_end
-					return
-				self.control(word, param)
-			consume_end(f)
-		else:
-			c = f.read(1)
-			if c == b'*':
-				self.group.dest = NullDevice()
-			elif c == b"'":
-				self.write(bytes([int(f.read(2), 16)]).decode('ansi'))
-			elif c in SPECIAL:
-				self.write(c.decode())
-			elif c == b'~':
-				self.group.dest.nbsp(self.group, self)
-			elif c == b'-':
-				self.group.dest.opt_hyphen(self.group, self)
-			elif c == b'_':
-				self.group.dest.nb_hyphen(self.group, self)
-			elif c == b':':
-				raise ValueError('subentry')
-			else:
-				raise ValueError(c)
-
-	def control(self, word, param):
-		group = self.group
-		if word == 'par':
-			group.dest.par(group, self)
-		elif word == 'line':
-			group.dest.line(group, self)
-		elif word in TOGGLE:
-			group.toggle(word, param)
-		elif word == 'ql':
-			group.prop.pop('q', None)
-		elif word.startswith('q'):  # alignment
-			group.prop['q'] = word[1:]
-		elif word == 'ulnone':
-			group.prop.pop('ul', None)
-		elif word.startswith('ul'):
-			group.prop['ul'] = word[2:]
-		elif word == 'pard':
-			group.reset(PARFMT)
-		elif word == 'plain':
-			group.reset(CHRFMT)
-			group.prop['f'] = self.deff
-			# use actual font obj?
-		elif word == 'rtf':
-			group.dest = self.output
-		elif word == 'fonttbl':
-			group.dest = self.font_table
-		elif word == 'colortbl':
-			group.dest = self.color_table
-		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl'}:
-			group.dest = NullDevice()
-		elif word in CHARSETS:
-			self.charset = word
-		elif word == 'deff':
-			self.deff = group.prop['f'] = param
-		elif word in FONT_FAMILIES:
-			group.prop['family'] = word[1:]
-		elif word not in IGNORE_WORDS:
-			group.prop[word] = param			
-	
-	def write(self, text):
-		self.group.write(text, self)
-
-	def parse(self):
-		with open(self.file, 'rb') as f:
+	def parse(self, file):
+		with open(file, 'rb') as f:
 			while True:
 				text = read_while(f, not_control).replace(b'\r\n', b'')
 				if text:
-					self.write(text.decode())
+					self.dest.write(text.decode())
 				c = f.read(1)
 				if c == b'{':
 					self.group = Group(self.group)
@@ -325,17 +219,131 @@ class Parser:
 					self.read_control(f)
 				elif not c:
 					break
-	
+
+	def read_control(self, f):
+		word = read_while(f, is_letter).decode()
+		if word:
+			if word in ESCAPE:
+				self.dest.write(ESCAPE[word])
+			else:
+				param = read_while(f, is_digit)
+				param = int(param) if param else None  # can we make the default True?
+				if word == 'u':
+					# we can always handle unicode
+					self.dest.write(chr(param))
+					skip_chars(f, self.prop.get('uc', 1))
+					# don't do consume_end
+					return
+				self.control(word, param)
+			consume_end(f)
+		else:
+			c = f.read(1)
+			if c == b'*':
+				self.dest = NullDevice()
+			elif c == b"'":
+				self.dest.write(bytes([int(f.read(2), 16)]).decode('ansi'))
+			elif c in SPECIAL:
+				self.dest.write(c.decode())
+			elif c == b'~':
+				self.dest.nbsp()
+			elif c == b'-':
+				self.dest.opt_hyphen()
+			elif c == b'_':
+				self.dest.nb_hyphen()
+			elif c == b':':
+				raise ValueError('subentry')
+			else:
+				raise ValueError(c)
+
+	def control(self, word, param):
+		if word == 'par':
+			self.dest.par()
+		elif word == 'line':
+			self.dest.line()
+		elif word in TOGGLE:
+			self.toggle(word, param)
+		elif word == 'ql':
+			self.prop.pop('q', None)
+		elif word.startswith('q'):  # alignment
+			self.prop['q'] = word[1:]
+		elif word == 'ulnone':
+			self.prop.pop('ul', None)
+		elif word.startswith('ul'):
+			self.prop['ul'] = word[2:]
+		elif word == 'pard':
+			self.reset(PARFMT)
+		elif word == 'plain':
+			self.reset(CHRFMT)
+			self.prop['f'] = self.deff
+		# use actual font obj?
+		elif word == 'rtf':
+			self.dest = self.output
+		elif word == 'fonttbl':
+			self.dest = self.font_table
+		elif word == 'colortbl':
+			self.dest = self.color_table
+		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl'}:
+			self.dest = NullDevice()
+		elif word in CHARSETS:
+			self.charset = word
+		elif word == 'deff':
+			self.deff = self.prop['f'] = param
+		elif word in FONT_FAMILIES:
+			self.prop['family'] = word[1:]
+		elif word not in IGNORE_WORDS:
+			self.prop[word] = param
+
+	def toggle(self, word, param):
+		if param == 0:
+			self.prop.pop(word, None)
+		else:
+			self.prop[word] = True if param is None else param
+
+	def reset(self, properties):
+		for name in properties:
+			self.prop.pop(name, None)
+
 	@property
 	def prop(self):
 		return self.group.prop
 
+	@property
+	def dest(self):
+		return self.group.dest
+
+	@dest.setter
+	def dest(self, value):
+		self.group.dest = value
+
+	@property
 	def font(self):
 		return self.font_table.fonts[self.prop['f']]
 
+	def color(self, i):
+		colors = self.color_table.colors
+		return BLACK if not colors else colors[i]
 
-rtf = Parser(file)
-rtf.parse()
+	@property
+	def color_foreground(self):
+		return self.color(self.prop.get('cf', 0))
+
+	@property
+	def color_background(self):
+		return self.color(self.prop.get('cb', 0))
+
+
+class Recorder(Output):
+
+	def __init__(self, doc):
+		super().__init__(doc)
+		self.full_text = []
+
+	def write(self, text):
+		self.full_text.append(text)
+
+
+rtf = Parser(Recorder)
+rtf.parse(file)
 
 
 # print([f.name for f in rtf.font_table.fonts.values()])
