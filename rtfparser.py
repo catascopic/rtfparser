@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 import sys
 
@@ -5,7 +7,7 @@ from abc import ABC
 from dataclasses import dataclass
 from collections import Counter
 from pathlib import Path
-
+from typing import Union
 
 if len(sys.argv) > 1:
 	file = Path(sys.argv[1])
@@ -13,16 +15,53 @@ else:
 	file = Path('test.rtf')
 
 
-class Group:
+CHARSETS = {'ansi', 'mac', 'pc', 'pca'}
+FONT_FAMILIES = {
+	'fnil', 'froman', 'fswiss', 'fmodern', 
+	'fscript', 'fdecor', 'ftech', 'fbidi'
+}
+# Paragraph formatting (reset with \pard)
+PARFMT = {
+	's', 'hyphpar', 'intbl', 'keep', 'nowidctlpar', 'widctlpar', 
+	'keepn', 'level', 'noline', 'outlinelevel', 'pagebb', 'sbys',
+	# use q to keep track of alignment
+	'q',
+	# Indentation
+	'fi', 'li', 'ri',
+	# Spacing
+	'sb', 'sa', 'sl', 'slmult',
+	# Subdocuments
+	'subdocument',
+	# Bidirectional
+	'rtlpar', 'ltrpar',
+}
 
-	def __init__(self, parent=None):
-		self.parent = parent
-		if parent:
-			self.dest = parent.dest
-			self.prop = parent.prop.copy()
-		else:
-			self.dest = NullDevice()
-			self.prop = {}
+# Character formatting (reset with \plain)
+TOGGLE = {'b', 'caps', 'deleted', 'i', 'outl', 'scaps', 'shad', 'strike', 'ul', 'v'}
+CHRFMT = {
+	'animtext', 'charscalex', 'dn', 'embo', 'impr', 'sub', 'expnd', 'expndtw',
+	'kerning', 'f', 'fs', 'strikedl', 'up', 'super', 'cf', 'cb', 'rtlch',
+	'ltrch', 'cs', 'cchs', 'lang',
+} | TOGGLE
+
+# TABS = { ... }
+
+ESCAPE = {
+	'tab':       '\t',
+	'emdash':    '—',
+	'endash':    '-',
+	'lquote':    '‘',
+	'rquote':    '’',
+	'ldblquote': '“',
+	'rdblquote': '”',
+	'bullet':    '•',
+}
+
+IGNORE_WORDS = {'nouicompat', 'viewkind'}
+
+SPECIAL = {b'\\', b'{', b'}'}
+
+NEWLINE = re.compile(r"[\r\n]")
 
 
 class Destination(ABC):
@@ -107,63 +146,30 @@ class NullDevice(Destination):
 		pass  # do nothing
 
 
-CHARSETS = {'ansi', 'mac', 'pc', 'pca'}
-FONT_FAMILIES = {
-	'fnil', 'froman', 'fswiss', 'fmodern', 
-	'fscript', 'fdecor', 'ftech', 'fbidi'
-}
-# Paragraph formatting (reset with \pard)
-PARFMT = {
-	's', 'hyphpar', 'intbl', 'keep', 'nowidctlpar', 'widctlpar', 
-	'keepn', 'level', 'noline', 'outlinelevel', 'pagebb', 'sbys',
-	# use q to keep track of alignment
-	'q',
-	# Indentation
-	'fi', 'li', 'ri',
-	# Spacing
-	'sb', 'sa', 'sl', 'slmult',
-	# Subdocuments
-	'subdocument',
-	# Bidirectional
-	'rtlpar', 'ltrpar',
-}
+@dataclass
+class Group:
+	parent: Group
+	dest: Destination
+	prop: dict[str, Union[int, bool]]
 
-# Character formatting (reset with \plain)
-TOGGLE = {'b', 'caps', 'deleted', 'i', 'outl', 'scaps', 'shad', 'strike', 'ul', 'v'}
-CHRFMT = {
-	'animtext', 'charscalex', 'dn', 'embo', 'impr', 'sub', 'nosupersub', 
-	'expnd', 'expndtw', 'kerning', 'f', 'fs', 'strikedl', 'up',
-	'super', 'cf', 'cb', 'rtlch', 'ltrch', 'cs', 'cchs', 'lang',
-} | TOGGLE
+	@classmethod
+	def root(cls):
+		return cls(None, NullDevice(), {})
 
-# TABS = { ... }
-
-ESCAPE = {
-	'tab':       '\t',
-	'emdash':    '—',
-	'endash':    '-',
-	'lquote':    '‘',
-	'rquote':    '’',
-	'ldblquote': '“',
-	'rdblquote': '”',
-	'bullet':    '•',
-}
-
-IGNORE_WORDS = {'nouicompat', 'viewkind'}
-
-SPECIAL = {b'\\', b'{', b'}'}
-
-
-def is_letter(c):
-	return b'a' <= c <= b'z' or b'A' <= c <= b'Z'
-
-
-def is_digit(c):
-	return b'0' <= c <= b'9' or c == '-'
+	def make_child(self):
+		return Group(self, self.dest, self.prop.copy())
 
 
 def not_control(c):
 	return c not in SPECIAL
+
+
+def is_letter(c):
+	return b'a' <= c <= b'z'
+
+
+def is_digit(c):
+	return b'0' <= c <= b'9' or c == b'-'
 
 
 def read_while(f, matcher):
@@ -174,6 +180,17 @@ def read_while(f, matcher):
 			end = f.tell()
 			f.seek(start)
 			return f.read(end - start - len(c))
+
+
+def read_word(f):
+	return read_while(f, is_letter)
+
+
+def read_number(f):
+	c = f.read(1)
+	if c == b'-' or is_digit(c):
+		return c + read_while(f, is_digit)
+	f.seek(-1, 1)
 
 
 def consume_end(f):
@@ -187,11 +204,12 @@ def consume_end(f):
 
 def skip_chars(f, n=1):
 	for _ in range(n):
-		c = f.read(1)
-		if c == b'\\':
-			read_while(f, is_letter)
-			read_while(f, is_digit)
-			consume_end(f)
+		if f.read(1) == b'\\':
+			if read_word(f):
+				read_number(f)
+				consume_end(f)
+			elif f.read(1) == b"'":
+				f.read(2)
 
 
 class Parser:
@@ -200,19 +218,19 @@ class Parser:
 		self.output = output(self)
 		self.font_table = FontTable(self)
 		self.color_table = ColorTable(self)
-		self.group = Group()
+		self.group = Group.root()
 		self.charset = 'ansi'
 		self.deff = None
 
 	def parse(self, file):
 		with open(file, 'rb') as f:
 			while True:
-				text = read_while(f, not_control).replace(b'\r\n', b'')
+				text = NEWLINE.sub('', read_while(f, not_control).decode('ascii'))
 				if text:
-					self.dest.write(text.decode())
+					self.dest.write(text)
 				c = f.read(1)
 				if c == b'{':
-					self.group = Group(self.group)
+					self.group = self.group.make_child()
 				elif c == b'}':
 					self.group = self.group.parent
 				elif c == b'\\':
@@ -221,13 +239,13 @@ class Parser:
 					break
 
 	def read_control(self, f):
-		word = read_while(f, is_letter).decode()
+		word = read_word(f).decode('ascii')
 		if word:
 			if word in ESCAPE:
 				self.dest.write(ESCAPE[word])
 			else:
-				param = read_while(f, is_digit)
-				param = int(param) if param else None  # can we make the default True?
+				param = read_number(f)
+				param = int(param) if param else True
 				if word == 'u':
 					# we can always handle unicode
 					self.dest.write(chr(param))
@@ -241,9 +259,10 @@ class Parser:
 			if c == b'*':
 				self.dest = NullDevice()
 			elif c == b"'":
-				self.dest.write(bytes([int(f.read(2), 16)]).decode('ansi'))
+				# can python handle charsets other than ansi?
+				self.dest.write(bytes([int(f.read(2), 16)]).decode(self.charset))
 			elif c in SPECIAL:
-				self.dest.write(c.decode())
+				self.dest.write(c.decode('ascii'))
 			elif c == b'~':
 				self.dest.nbsp()
 			elif c == b'-':
@@ -251,7 +270,9 @@ class Parser:
 			elif c == b'_':
 				self.dest.nb_hyphen()
 			elif c == b':':
-				raise ValueError('subentry')
+				raise ValueError('subentry not handled')
+			elif c == '\r' or c == '\n':
+				self.dest.par()
 			else:
 				raise ValueError(c)
 
@@ -270,6 +291,9 @@ class Parser:
 			self.prop.pop('ul', None)
 		elif word.startswith('ul'):
 			self.prop['ul'] = word[2:]
+		elif word == 'nosupersub':
+			self.prop.pop('super', None)
+			self.prop.pop('sub', None)
 		elif word == 'pard':
 			self.reset(PARFMT)
 		elif word == 'plain':
@@ -283,12 +307,14 @@ class Parser:
 		elif word == 'colortbl':
 			self.dest = self.color_table
 		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl'}:
+			# these destinations are unsupported
 			self.dest = NullDevice()
 		elif word in CHARSETS:
 			self.charset = word
 		elif word == 'deff':
 			self.deff = self.prop['f'] = param
 		elif word in FONT_FAMILIES:
+			# this property name is made up
 			self.prop['family'] = word[1:]
 		elif word not in IGNORE_WORDS:
 			self.prop[word] = param
@@ -297,7 +323,7 @@ class Parser:
 		if param == 0:
 			self.prop.pop(word, None)
 		else:
-			self.prop[word] = True if param is None else param
+			self.prop[word] = param
 
 	def reset(self, properties):
 		for name in properties:
@@ -314,22 +340,52 @@ class Parser:
 	@dest.setter
 	def dest(self, value):
 		self.group.dest = value
+		
+	@property
+	def fonts(self):
+		return self.font_table.fonts
 
 	@property
 	def font(self):
-		return self.font_table.fonts[self.prop['f']]
+		return self.fonts[self.prop['f']]
 
-	def color(self, i):
-		colors = self.color_table.colors
-		return BLACK if not colors else colors[i]
+	def get_color(self, i):
+		return BLACK if not self.colors else self.colors[i]
+
+	@property
+	def colors(self):
+		return self.color_table.colors
 
 	@property
 	def color_foreground(self):
-		return self.color(self.prop.get('cf', 0))
+		return self.get_color(self.prop.get('cf', 0))
 
 	@property
 	def color_background(self):
-		return self.color(self.prop.get('cb', 0))
+		return self.get_color(self.prop.get('cb', 0))
+
+	@property
+	def bold(self):
+		return self.prop.get('b', False)
+
+	@property
+	def italic(self):
+		return self.prop.get('i', False)
+
+	@property
+	def underline(self):
+		return self.prop.get('u', False)
+
+	@property
+	def alignment(self):
+		# TODO: make enum?
+		return self.prop.get('q', 'l')
+
+	@property
+	def font_size(self):
+		return self.prop['fs']
+	
+	# TODO: line spacing?
 
 
 class Recorder(Output):
