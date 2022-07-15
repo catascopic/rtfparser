@@ -9,12 +9,16 @@ from collections import Counter
 from pathlib import Path
 from typing import Union
 
+
+# TODO: \upr, \ud
+
+
 if len(sys.argv) > 1:
 	file = Path(sys.argv[1])
 else:
 	file = Path('test.rtf')
 
-
+ASCII = 'ascii'
 CHARSETS = {'ansi', 'mac', 'pc', 'pca'}
 FONT_FAMILIES = {
 	'fnil', 'froman', 'fswiss', 'fmodern', 
@@ -37,7 +41,7 @@ PARFMT = {
 }
 
 # Character formatting (reset with \plain)
-TOGGLE = {'b', 'caps', 'deleted', 'i', 'outl', 'scaps', 'shad', 'strike', 'ul', 'v'}
+TOGGLE = {'b', 'caps', 'deleted', 'i', 'outl', 'scaps', 'shad', 'strike', 'ul', 'v'}  # hyphpar
 CHRFMT = {
 	'animtext', 'charscalex', 'dn', 'embo', 'impr', 'sub', 'expnd', 'expndtw',
 	'kerning', 'f', 'fs', 'strikedl', 'up', 'super', 'cf', 'cb', 'rtlch',
@@ -73,7 +77,7 @@ class Destination(ABC):
 		self.write('\n')
 
 	def line(self):
-		self.par()
+		self.write('\n')
 
 	def nbsp(self):
 		self.write(u'\u00A0')
@@ -164,22 +168,30 @@ def not_control(c):
 	return c not in SPECIAL
 
 
+# TODO: is mmathPr and other stuff actually valid RTF?
 def is_letter(c):
-	return b'a' <= c <= b'z'
+	return b'a' <= c <= b'z' or b'A' <= c <= b'Z'
 
 
 def is_digit(c):
-	return b'0' <= c <= b'9' or c == b'-'
+	return b'0' <= c <= b'9'
 
 
 def read_while(f, matcher):
-	start = f.tell()
+	buf = bytearray()
+	read_into_while(f, buf, matcher)
+	return buf
+
+
+def read_into_while(f, buf, matcher):
 	while True:
 		c = f.read(1)
-		if not matcher(c) or not c:
-			end = f.tell()
-			f.seek(start)
-			return f.read(end - start - len(c))
+		if not matcher(c):
+			f.seek(-1, 1)
+			return
+		if not c:
+			return
+		buf.extend(c)
 
 
 def read_word(f):
@@ -188,25 +200,26 @@ def read_word(f):
 
 def read_number(f):
 	c = f.read(1)
-	if c == b'-' or is_digit(c):
-		return c + read_while(f, is_digit)
+	if is_digit(c) or c == b'-':
+		buf = bytearray(c)
+		read_into_while(f, buf, is_digit)
+		return buf
 	f.seek(-1, 1)
 
 
 def consume_end(f):
 	c = f.read(1)
-	if c == b'\r':
-		f.read(1)
-		# check that this next char is \n?
-	elif not c.isspace():
+	if not c.isspace():
 		f.seek(-1, 1)
+	# we don't need to handle the CRLF case because we read the CR here and
+	# skip the LF later while reading normally
 
 
-def skip_chars(f, n=1):
+def skip_chars(f, n):
 	for _ in range(n):
 		if f.read(1) == b'\\':
 			if read_word(f):
-				read_number(f)
+				read_number(f)  # unnecessary?
 				consume_end(f)
 			elif f.read(1) == b"'":
 				f.read(2)
@@ -214,32 +227,35 @@ def skip_chars(f, n=1):
 
 class Parser:
 
-	def __init__(self, output):
+	def __init__(self, output, plain_text=False):
 		self.output = output(self)
 		self.font_table = FontTable(self)
 		self.color_table = ColorTable(self)
 		self.group = Group.root()
+		self.plain_text = plain_text
 		self.charset = 'ansi'
 		self.deff = None
+		self.rtf_version = None
 
 	def parse(self, file):
 		with open(file, 'rb') as f:
 			while True:
-				text = NEWLINE.sub('', read_while(f, not_control).decode('ascii'))
+				text = NEWLINE.sub('', read_while(f, not_control).decode(ASCII))
 				if text:
 					self.dest.write(text)
 				c = f.read(1)
-				if c == b'{':
+				if c == b'\\':
+					self.read_control(f)
+				elif c == b'{':
 					self.group = self.group.make_child()
 				elif c == b'}':
 					self.group = self.group.parent
-				elif c == b'\\':
-					self.read_control(f)
-				elif not c:
+				else:
+					# must be EOF
 					break
 
 	def read_control(self, f):
-		word = read_word(f).decode('ascii')
+		word = read_word(f).decode(ASCII)
 		if word:
 			if word in ESCAPE:
 				self.dest.write(ESCAPE[word])
@@ -256,13 +272,11 @@ class Parser:
 			consume_end(f)
 		else:
 			c = f.read(1)
-			if c == b'*':
-				self.dest = NullDevice()
-			elif c == b"'":
+			if c == b"'":
 				# can python handle charsets other than ansi?
 				self.dest.write(bytes([int(f.read(2), 16)]).decode(self.charset))
 			elif c in SPECIAL:
-				self.dest.write(c.decode('ascii'))
+				self.dest.write(c.decode(ASCII))
 			elif c == b'~':
 				self.dest.nbsp()
 			elif c == b'-':
@@ -273,6 +287,8 @@ class Parser:
 				raise ValueError('subentry not handled')
 			elif c == '\r' or c == '\n':
 				self.dest.par()
+			elif c == b'*':
+				self.try_read_destination(f)
 			else:
 				raise ValueError(c)
 
@@ -281,6 +297,8 @@ class Parser:
 			self.dest.par()
 		elif word == 'line':
 			self.dest.line()
+		elif word == 'page':
+			pass  # self.dest.page_break()
 		elif word in TOGGLE:
 			self.toggle(word, param)
 		elif word == 'ql':
@@ -294,18 +312,24 @@ class Parser:
 		elif word == 'nosupersub':
 			self.prop.pop('super', None)
 			self.prop.pop('sub', None)
+		elif word == 'nowidctlpar':
+			self.prop.pop('widctlpar', None)
 		elif word == 'pard':
 			self.reset(PARFMT)
+			self.list_type = None
 		elif word == 'plain':
 			self.reset(CHRFMT)
+			# use actual font obj?
 			self.prop['f'] = self.deff
-		# use actual font obj?
 		elif word == 'rtf':
 			self.dest = self.output
+			self.rtf_version = param
 		elif word == 'fonttbl':
 			self.dest = self.font_table
 		elif word == 'colortbl':
 			self.dest = self.color_table
+		elif word == 'pntext':
+			self.dest = self.output if self.plain_text else NullDevice()
 		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl'}:
 			# these destinations are unsupported
 			self.dest = NullDevice()
@@ -316,6 +340,10 @@ class Parser:
 		elif word in FONT_FAMILIES:
 			# this property name is made up
 			self.prop['family'] = word[1:]
+
+		elif word == 'pnlvlblt':
+			self.list_type
+			
 		elif word not in IGNORE_WORDS:
 			self.prop[word] = param
 
@@ -328,6 +356,17 @@ class Parser:
 	def reset(self, properties):
 		for name in properties:
 			self.prop.pop(name, None)
+	
+	def try_read_destination(self, f):
+		c = f.read(1)
+		if c != b'\\':
+			raise ValueError(c)
+		word = read_word(f)
+		if word == 'pn':
+			self.list_type = ListType()
+			self.dest = NullDevice()
+		else:
+			self.dest = NullDevice()
 
 	@property
 	def prop(self):
@@ -340,6 +379,10 @@ class Parser:
 	@dest.setter
 	def dest(self, value):
 		self.group.dest = value
+
+	def change_dest(self, new_dest):
+		self.group.dest = value
+		self.group.prop = {}
 		
 	@property
 	def fonts(self):
@@ -407,8 +450,9 @@ full_text = ''.join(rtf.output.full_text)
 # (?:[^\W_]|['‘’\-])
 WORDS = re.compile(r"[^\W_][\w'‘’\-]*")
 words = WORDS.findall(full_text)
-print(' '.join([w for w, c in Counter(w.lower().strip("'‘’") for w in words).items() if c == 1][-24:]))
+# print(' '.join([w for w, c in Counter(w.lower().strip("'‘’") for w in words).items() if c == 1][-24:]))
 # print(sorted(Counter(w.lower().strip("'‘’") for w in words).items(), key=lambda x: -x[1])[128:256])
+print(full_text)
 print(f'words: {len(words)}, chars: {len(full_text)}')
 mark = full_text.rfind('^')
 if mark != -1:
@@ -423,3 +467,4 @@ if bad_quote_words:
 # print('shared:', shared)
 # for k, v in sorted(rtf.output.count.items(), key=lambda a: a[1]):
 	# print(f'{v:6}: {sorted(k - shared)}')
+
