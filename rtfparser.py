@@ -450,9 +450,7 @@ full_text = ''.join(rtf.output.full_text)
 # (?:[^\W_]|['‘’\-])
 WORDS = re.compile(r"[^\W_][\w'‘’\-]*")
 words = WORDS.findall(full_text)
-# print(' '.join([w for w, c in Counter(w.lower().strip("'‘’") for w in words).items() if c == 1][-24:]))
-# print(sorted(Counter(w.lower().strip("'‘’") for w in words).items(), key=lambda x: -x[1])[128:256])
-print(full_text)
+print(' '.join([w for w, c in Counter(w.lower().strip("'‘’") for w in words).items() if c == 1][-24:]))
 print(f'words: {len(words)}, chars: {len(full_text)}')
 mark = full_text.rfind('^')
 if mark != -1:
@@ -461,10 +459,3 @@ if mark != -1:
 bad_quote_words = re.findall(r"\S+['\"]\S+", full_text)
 if bad_quote_words:
 	print('BAD QUOTES:', ' '.join(bad_quote_words))
-
-# from collections import Counter
-# shared = set.intersection(*(set(s) for s in rtf.output.count.keys()))
-# print('shared:', shared)
-# for k, v in sorted(rtf.output.count.items(), key=lambda a: a[1]):
-	# print(f'{v:6}: {sorted(k - shared)}')
-
