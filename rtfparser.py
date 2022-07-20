@@ -51,6 +51,7 @@ CHRFMT = {
 # TABS = { ... }
 
 ESCAPE = {
+	'line':      '\n',
 	'tab':       '\t',
 	'emdash':    '—',
 	'endash':    '-',
@@ -61,9 +62,15 @@ ESCAPE = {
 	'bullet':    '•',
 }
 
-IGNORE_WORDS = {'nouicompat', 'viewkind'}
+SPECIAL = {
+	b'~': u'\u00A0',  # nonbreaking space
+	b'-': u'\u00AD',  # optional hyphen
+	b'_': u'\u2011',  # nonbreaking hyphen
+}
 
-SPECIAL = {b'\\', b'{', b'}'}
+META_CHARS = {b'\\', b'{', b'}'}
+
+IGNORE_WORDS = {'nouicompat', 'viewkind'}
 
 NEWLINE = re.compile(r"[\r\n]")
 
@@ -72,27 +79,16 @@ class Destination(ABC):
 
 	def write(self, text):
 		return NotImplemented
+	
+	# TODO: reconsider this?
+	def write_special(self, c):
+		self.write(c)
 
 	def par(self):
 		self.write('\n')
-
-	def line(self):
-		self.write('\n')
-
-	def nbsp(self):
-		self.write(u'\u00A0')
-
-	def opt_hyphen(self):
-		self.write(u'\u00AD')
-
-	def nb_hyphen(self):
-		self.write(u'\u2011')
-
-
-class Output(Destination):
-
-	def __init__(self, doc):
-		self.doc = doc
+	
+	def page_break(self):
+		pass
 
 
 @dataclass
@@ -165,7 +161,7 @@ class Group:
 
 
 def not_control(c):
-	return c not in SPECIAL
+	return c not in META_CHARS
 
 
 # TODO: is mmathPr and other stuff actually valid RTF?
@@ -195,15 +191,15 @@ def read_into_while(f, buf, matcher):
 
 
 def read_word(f):
-	return read_while(f, is_letter)
+	return read_while(f, is_letter).decode(ASCII)
 
 
-def read_number(f):
+def read_number(f, default=None):
 	c = f.read(1)
 	if is_digit(c) or c == b'-':
 		buf = bytearray(c)
 		read_into_while(f, buf, is_digit)
-		return buf
+		return int(buf) if buf else default
 	f.seek(-1, 1)
 
 
@@ -255,97 +251,93 @@ class Parser:
 					break
 
 	def read_control(self, f):
-		word = read_word(f).decode(ASCII)
+		word = read_word(f)
 		if word:
-			if word in ESCAPE:
-				self.dest.write(ESCAPE[word])
+			if s := ESCAPE.get(word):
+				self.dest.write_special(s)
 			else:
-				param = read_number(f)
-				param = int(param) if param else True
+				param = read_number(f, True)
+				# handle \u separately because it advances the reader
 				if word == 'u':
+					self.dest.write_special(chr(param))
 					# we can always handle unicode
-					self.dest.write(chr(param))
 					skip_chars(f, self.prop.get('uc', 1))
-					# don't do consume_end
-					return
-				self.control(word, param)
+				else:
+					self.control(word, param)
 			consume_end(f)
 		else:
 			c = f.read(1)
+			# using bytes rather than strings here!
 			if c == b"'":
 				# can python handle charsets other than ansi?
-				self.dest.write(bytes([int(f.read(2), 16)]).decode(self.charset))
-			elif c in SPECIAL:
-				self.dest.write(c.decode(ASCII))
-			elif c == b'~':
-				self.dest.nbsp()
-			elif c == b'-':
-				self.dest.opt_hyphen()
-			elif c == b'_':
-				self.dest.nb_hyphen()
-			elif c == b':':
-				raise ValueError('subentry not handled')
-			elif c == '\r' or c == '\n':
+				self.dest.write_special(bytes([int(f.read(2), 16)]).decode(self.charset))
+			elif c in META_CHARS:
+				self.dest.write_special(c.decode(ASCII))
+			elif s := SPECIAL.get(c):
+				self.dest.write_special(s)
+			elif c == b'\r' or c == b'\n':
 				self.dest.par()
 			elif c == b'*':
-				self.try_read_destination(f)
+				# TODO: fix this
+				self.change_dest(NullDevice())
 			else:
-				raise ValueError(c)
-
-	def control(self, word, param):
-		if word == 'par':
-			self.dest.par()
-		elif word == 'line':
-			self.dest.line()
-		elif word == 'page':
-			pass  # self.dest.page_break()
+				raise ValueError(f"{c} at {f.tell()}")
+	
+	def control(self, word, param):	
+		if instr := getattr(self, word, None):
+			args = (param,) if type(param) is int else ()
+			instr(*args)
 		elif word in TOGGLE:
 			self.toggle(word, param)
-		elif word == 'ql':
-			self.prop.pop('q', None)
 		elif word.startswith('q'):  # alignment
 			self.prop['q'] = word[1:]
-		elif word == 'ulnone':
-			self.prop.pop('ul', None)
 		elif word.startswith('ul'):
 			self.prop['ul'] = word[2:]
-		elif word == 'nosupersub':
-			self.prop.pop('super', None)
-			self.prop.pop('sub', None)
-		elif word == 'nowidctlpar':
-			self.prop.pop('widctlpar', None)
-		elif word == 'pard':
-			self.reset(PARFMT)
-			self.list_type = None
-		elif word == 'plain':
-			self.reset(CHRFMT)
-			# use actual font obj?
-			self.prop['f'] = self.deff
-		elif word == 'rtf':
-			self.dest = self.output
-			self.rtf_version = param
-		elif word == 'fonttbl':
-			self.dest = self.font_table
-		elif word == 'colortbl':
-			self.dest = self.color_table
-		elif word == 'pntext':
-			self.dest = self.output if self.plain_text else NullDevice()
 		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl'}:
 			# these destinations are unsupported
-			self.dest = NullDevice()
+			self.change_dest(NullDevice())
 		elif word in CHARSETS:
 			self.charset = word
-		elif word == 'deff':
-			self.deff = self.prop['f'] = param
 		elif word in FONT_FAMILIES:
 			# this property name is made up
 			self.prop['family'] = word[1:]
-
-		elif word == 'pnlvlblt':
-			self.list_type
-			
 		elif word not in IGNORE_WORDS:
 			self.prop[word] = param
+
+	def par(self):
+		self.dest.par()
+	def page(self):
+		pass  # self.dest.page_break()
+	def ql(self):
+		self.prop.pop('q', None)
+	def ulnone(self):
+		self.prop.pop('ul', None)
+	def nosupersub(self):
+		self.prop.pop('super', None)
+		self.prop.pop('sub', None)
+	def nowidctlpar(self):
+		self.prop.pop('widctlpar', None)
+	def pard(self):
+		self.reset(PARFMT)
+		self.list_type = None
+	def plain(self):
+		self.reset(CHRFMT)
+		# use actual font obj?
+		self.prop['f'] = self.deff
+	def rtf(self, param):
+		self.change_dest(self.output)
+		self.rtf_version = param
+	def fonttbl(self):
+		self.change_dest(self.font_table)
+	def colortbl(self):
+		self.change_dest(self.color_table)
+	def pntext(self):
+		self.change_dest(self.output if self.plain_text else NullDevice())
+	def deff(self, param):
+		self.deff = self.prop['f'] = param
+	def pnlvlblt(self):
+		pass
+
 
 	def toggle(self, word, param):
 		if param == 0:
@@ -358,15 +350,16 @@ class Parser:
 			self.prop.pop(name, None)
 	
 	def try_read_destination(self, f):
+		read_while(f, lambda c: c == b'\r' or c == b'\n')
 		c = f.read(1)
 		if c != b'\\':
-			raise ValueError(c)
+			raise ValueError(f"{c} at {f.tell()}")
 		word = read_word(f)
 		if word == 'pn':
 			self.list_type = ListType()
-			self.dest = NullDevice()
+			self.change_dest(NullDevice())
 		else:
-			self.dest = NullDevice()
+			self.change_dest(NullDevice())
 
 	@property
 	def prop(self):
@@ -376,17 +369,23 @@ class Parser:
 	def dest(self):
 		return self.group.dest
 
-	@dest.setter
-	def dest(self, value):
-		self.group.dest = value
-
 	def change_dest(self, new_dest):
-		self.group.dest = value
+		self.group.dest = new_dest
 		self.group.prop = {}
-		
+
+
+class Output(Destination):
+
+	def __init__(self, doc):
+		self._doc = doc
+	
+	@property
+	def prop(self):
+		return self._doc.prop
+	
 	@property
 	def fonts(self):
-		return self.font_table.fonts
+		return self._doc.font_table.fonts
 
 	@property
 	def font(self):
@@ -397,7 +396,7 @@ class Parser:
 
 	@property
 	def colors(self):
-		return self.color_table.colors
+		return self._doc.color_table.colors
 
 	@property
 	def color_foreground(self):
