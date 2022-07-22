@@ -79,10 +79,6 @@ class Destination(ABC):
 
 	def write(self, text):
 		return NotImplemented
-	
-	# TODO: reconsider this?
-	def write_special(self, c):
-		self.write(c)
 
 	def par(self):
 		self.write('\n')
@@ -221,6 +217,13 @@ def skip_chars(f, n):
 				f.read(2)
 
 
+control_words = {}
+
+def controlword(func):
+	control_words[func.__name__] = func
+	return func
+	
+
 class Parser:
 
 	def __init__(self, output, plain_text=False):
@@ -254,12 +257,12 @@ class Parser:
 		word = read_word(f)
 		if word:
 			if s := ESCAPE.get(word):
-				self.dest.write_special(s)
+				self.dest.write(s)
 			else:
 				param = read_number(f, True)
 				# handle \u separately because it advances the reader
 				if word == 'u':
-					self.dest.write_special(chr(param))
+					self.dest.write(chr(param))
 					# we can always handle unicode
 					skip_chars(f, self.prop.get('uc', 1))
 				else:
@@ -270,23 +273,23 @@ class Parser:
 			# using bytes rather than strings here!
 			if c == b"'":
 				# can python handle charsets other than ansi?
-				self.dest.write_special(bytes([int(f.read(2), 16)]).decode(self.charset))
+				self.dest.write(bytes([int(f.read(2), 16)]).decode(self.charset))
 			elif c in META_CHARS:
-				self.dest.write_special(c.decode(ASCII))
+				self.dest.write(c.decode(ASCII))
 			elif s := SPECIAL.get(c):
-				self.dest.write_special(s)
+				self.dest.write(s)
 			elif c == b'\r' or c == b'\n':
 				self.dest.par()
 			elif c == b'*':
 				# TODO: fix this
-				self.change_dest(NullDevice())
+				self.dest = NullDevice()
 			else:
 				raise ValueError(f"{c} at {f.tell()}")
 	
 	def control(self, word, param):	
-		if instr := getattr(self, word, None):
+		if instr := control_words.get(word):
 			args = (param,) if type(param) is int else ()
-			instr(*args)
+			instr(self, param)
 		elif word in TOGGLE:
 			self.toggle(word, param)
 		elif word.startswith('q'):  # alignment
@@ -295,7 +298,7 @@ class Parser:
 			self.prop['ul'] = word[2:]
 		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl'}:
 			# these destinations are unsupported
-			self.change_dest(NullDevice())
+			self.dest = NullDevice()
 		elif word in CHARSETS:
 			self.charset = word
 		elif word in FONT_FAMILIES:
@@ -304,40 +307,53 @@ class Parser:
 		elif word not in IGNORE_WORDS:
 			self.prop[word] = param
 
+	@controlword
 	def par(self):
 		self.dest.par()
+	@controlword
 	def page(self):
-		pass  # self.dest.page_break()
+		self.dest.page_break()
+	@controlword
 	def ql(self):
 		self.prop.pop('q', None)
+	@controlword
 	def ulnone(self):
 		self.prop.pop('ul', None)
+	@controlword
 	def nosupersub(self):
 		self.prop.pop('super', None)
 		self.prop.pop('sub', None)
+	@controlword
 	def nowidctlpar(self):
 		self.prop.pop('widctlpar', None)
+	@controlword
 	def pard(self):
 		self.reset(PARFMT)
 		self.list_type = None
+	@controlword
 	def plain(self):
 		self.reset(CHRFMT)
 		# use actual font obj?
 		self.prop['f'] = self.deff
+	@controlword
 	def rtf(self, param):
-		self.change_dest(self.output)
+		self.dest = self.output
 		self.rtf_version = param
+	@controlword
 	def fonttbl(self):
-		self.change_dest(self.font_table)
+		self.dest = self.font_table
+	@controlword
 	def colortbl(self):
-		self.change_dest(self.color_table)
+		self.dest = self.color_table
+	@controlword
 	def pntext(self):
-		self.change_dest(self.output if self.plain_text else NullDevice())
+		self.dest = self.output if self.plain_text else NullDevice()
+	@controlword
 	def deff(self, param):
 		self.deff = self.prop['f'] = param
+	@controlword
 	def pnlvlblt(self):
 		pass
-
 
 	def toggle(self, word, param):
 		if param == 0:
@@ -357,9 +373,9 @@ class Parser:
 		word = read_word(f)
 		if word == 'pn':
 			self.list_type = ListType()
-			self.change_dest(NullDevice())
+			self.dest = NullDevice()
 		else:
-			self.change_dest(NullDevice())
+			self.dest = NullDevice()
 
 	@property
 	def prop(self):
@@ -369,9 +385,9 @@ class Parser:
 	def dest(self):
 		return self.group.dest
 
-	def change_dest(self, new_dest):
-		self.group.dest = new_dest
-		self.group.prop = {}
+	@dest.setter
+	def dest(self, value):
+		self.group.dest = value
 
 
 class Output(Destination):
