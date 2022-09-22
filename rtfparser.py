@@ -6,8 +6,9 @@ import sys
 from abc import ABC
 from dataclasses import dataclass
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
-from typing import Union
+from typing import Union, Callable
 
 
 # TODO: \upr, \ud
@@ -50,6 +51,9 @@ CHRFMT = {
 
 # TABS = { ... }
 
+TIME_UNITS = {'yr', 'mo', 'dy', 'hr', 'min', 'sec'}
+INFO_PROPS = {'version', 'edmins', 'nofpages', 'nofwords', 'word_count', 'nofchars', 'nofcharsws'}
+
 ESCAPE = {
 	'line':      '\n',
 	'tab':       '\t',
@@ -72,8 +76,6 @@ META_CHARS = {b'\\', b'{', b'}'}
 
 IGNORE_WORDS = {'nouicompat', 'viewkind'}
 
-NEWLINE = re.compile(r"[\r\n]")
-
 
 class Destination(ABC):
 
@@ -84,6 +86,9 @@ class Destination(ABC):
 		self.write('\n')
 	
 	def page_break(self):
+		pass
+	
+	def close(self):
 		pass
 
 
@@ -137,9 +142,58 @@ class ColorTable(Destination):
 			raise ValueError(text)
 
 
+class TextDest(Destination):
+
+	def __init__(self):
+		self.content = []
+	
+	def write(self, text):
+		self.content.append(text);
+	
+	@property
+	def text(self):
+		return ''.join(self.content)
+
+
+@dataclass
+class TimeDest(Destination):
+	yr: int = 0
+	mo: int = 0
+	dy: int = 0
+	hr: int = 0
+	min: int = 0
+	sec: int = 0
+
+	@property
+	def date(self):
+		return datetime(self.yr, self.mo, self.dy, self.hr, self.min, self.sec)
+
+
+class Info(Destination):
+	def __init__(self):
+		self.title = TextDest()
+		self.subject = TextDest()
+		self.author = TextDest()
+		self.manager = TextDest()
+		self.company = TextDest()
+		self.operator = TextDest()
+		self.category = TextDest()
+		self.keywords = TextDest()
+		self.comment = NullDevice()
+		self.doccomm = TextDest()
+		self.create_time = TimeDest()
+		self.revision_time = TimeDest()
+		self.print_time = TimeDest()
+		self.backup_time = TimeDest()
+
+
 class NullDevice(Destination):
 	def write(self, text):
 		pass  # do nothing
+
+
+def noop():
+	pass
 
 
 @dataclass
@@ -147,6 +201,7 @@ class Group:
 	parent: Group
 	dest: Destination
 	prop: dict[str, Union[int, bool]]
+	on_close: Callable[[], None] = noop
 
 	@classmethod
 	def root(cls):
@@ -195,8 +250,9 @@ def read_number(f, default=None):
 	if is_digit(c) or c == b'-':
 		buf = bytearray(c)
 		read_into_while(f, buf, is_digit)
-		return int(buf) if buf else default
+		return int(buf)
 	f.seek(-1, 1)
+	return default
 
 
 def consume_end(f):
@@ -215,13 +271,6 @@ def skip_chars(f, n):
 				consume_end(f)
 			elif f.read(1) == b"'":
 				f.read(2)
-
-
-control_words = {}
-
-def controlword(func):
-	control_words[func.__name__] = func
-	return func
 	
 
 class Parser:
@@ -230,6 +279,7 @@ class Parser:
 		self.output = output(self)
 		self.font_table = FontTable(self)
 		self.color_table = ColorTable(self)
+		self.info = Info()
 		self.group = Group.root()
 		self.plain_text = plain_text
 		self.charset = 'ansi'
@@ -239,7 +289,7 @@ class Parser:
 	def parse(self, file):
 		with open(file, 'rb') as f:
 			while True:
-				text = NEWLINE.sub('', read_while(f, not_control).decode(ASCII))
+				text = read_while(f, not_control).translate(None, b'\r\n').decode(ASCII)
 				if text:
 					self.dest.write(text)
 				c = f.read(1)
@@ -248,6 +298,7 @@ class Parser:
 				elif c == b'{':
 					self.group = self.group.make_child()
 				elif c == b'}':
+					self.dest.close()
 					self.group = self.group.parent
 				else:
 					# must be EOF
@@ -281,15 +332,14 @@ class Parser:
 			elif c == b'\r' or c == b'\n':
 				self.dest.par()
 			elif c == b'*':
-				# TODO: fix this
-				self.dest = NullDevice()
+				self.try_read_dest(f)
 			else:
 				raise ValueError(f"{c} at {f.tell()}")
 	
 	def control(self, word, param):	
-		if instr := control_words.get(word):
+		if instr := getattr(self, '_' + word, None):
 			args = (param,) if type(param) is int else ()
-			instr(self, param)
+			instr(*args)
 		elif word in TOGGLE:
 			self.toggle(word, param)
 		elif word.startswith('q'):  # alignment
@@ -304,56 +354,65 @@ class Parser:
 		elif word in FONT_FAMILIES:
 			# this property name is made up
 			self.prop['family'] = word[1:]
+		elif word in TIME_UNITS:
+			if isinstance(self.dest, TimeDest):
+				setattr(self.dest, word, param)
+			else:
+				raise ValueError(f"cannot set time unit {word} for {self.dest} ({type(self.dest)})")
 		elif word not in IGNORE_WORDS:
 			self.prop[word] = param
 
-	@controlword
-	def par(self):
+	# INSTRUCTION TABLE
+	
+	def _par(self):
 		self.dest.par()
-	@controlword
-	def page(self):
+	def _page(self):
 		self.dest.page_break()
-	@controlword
-	def ql(self):
+	def _ql(self):
 		self.prop.pop('q', None)
-	@controlword
-	def ulnone(self):
+	def _ulnone(self):
 		self.prop.pop('ul', None)
-	@controlword
-	def nosupersub(self):
+	def _nosupersub(self):
 		self.prop.pop('super', None)
 		self.prop.pop('sub', None)
-	@controlword
-	def nowidctlpar(self):
+	def _nowidctlpar(self):
 		self.prop.pop('widctlpar', None)
-	@controlword
-	def pard(self):
+	def _pard(self):
 		self.reset(PARFMT)
 		self.list_type = None
-	@controlword
-	def plain(self):
+	def _plain(self):
 		self.reset(CHRFMT)
 		# use actual font obj?
 		self.prop['f'] = self.deff
-	@controlword
-	def rtf(self, param):
+	def _rtf(self, a):
 		self.dest = self.output
-		self.rtf_version = param
-	@controlword
-	def fonttbl(self):
+		self.rtf_version = a
+	def _fonttbl(self):
 		self.dest = self.font_table
-	@controlword
-	def colortbl(self):
+	def _colortbl(self):
 		self.dest = self.color_table
-	@controlword
-	def pntext(self):
+	def _pntext(self):
 		self.dest = self.output if self.plain_text else NullDevice()
-	@controlword
-	def deff(self, param):
-		self.deff = self.prop['f'] = param
-	@controlword
-	def pnlvlblt(self):
+	def _deff(self, a):
+		self.deff = self.prop['f'] = a
+	def _pnlvlblt(self):
 		pass
+	def _info(self):
+		self.dest = self.info
+	def _author(self):
+		self.dest = self.info.author
+	def _creatim(self):
+		self.dest = self.info.create_time
+	def _revtim(self):
+		self.dest = self.info.revision_time
+	def _printim(self):
+		self.dest = self.info.print_time
+	def _buptim(self):
+		self.dest = self.info.backup_time
+	def _pn(self):
+		self.list_type = ListType()
+		self.dest = NullDevice()
+
 
 	def toggle(self, word, param):
 		if param == 0:
@@ -365,15 +424,14 @@ class Parser:
 		for name in properties:
 			self.prop.pop(name, None)
 	
-	def try_read_destination(self, f):
-		read_while(f, lambda c: c == b'\r' or c == b'\n')
+	def try_read_dest(self, f):
+		read_while(f, lambda c: c in b'\r\n')
 		c = f.read(1)
 		if c != b'\\':
 			raise ValueError(f"{c} at {f.tell()}")
 		word = read_word(f)
-		if word == 'pn':
-			self.list_type = ListType()
-			self.dest = NullDevice()
+		if instr := getattr(self, '_' + word, None):
+			instr()
 		else:
 			self.dest = NullDevice()
 
@@ -388,6 +446,7 @@ class Parser:
 	@dest.setter
 	def dest(self, value):
 		self.group.dest = value
+		self.group.on_close = self.dest.close
 
 
 class Output(Destination):
@@ -451,8 +510,15 @@ class Recorder(Output):
 	def __init__(self, doc):
 		super().__init__(doc)
 		self.full_text = []
+		self.last_prop = {}
 
 	def write(self, text):
+		if self.prop != self.last_prop:
+			# print()
+			# print('-', self.last_prop.items() - self.prop.items())
+			# print('+', self.prop.items() - self.last_prop.items())
+			self.last_prop = self.prop.copy()
+		#  print(text, end='')
 		self.full_text.append(text)
 
 
