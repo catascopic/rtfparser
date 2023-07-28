@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Union, Callable
+from typing import Callable
 
 
 # TODO: \upr, \ud
@@ -192,6 +192,10 @@ class NullDevice(Destination):
 		pass  # do nothing
 
 
+class ListType():
+	pass
+
+
 def noop():
 	pass
 
@@ -200,7 +204,7 @@ def noop():
 class Group:
 	parent: Group
 	dest: Destination
-	prop: dict[str, Union[int, bool]]
+	prop: dict[str, int | bool]
 	on_close: Callable[[], None] = noop
 
 	@classmethod
@@ -411,7 +415,8 @@ class Parser:
 		self.dest = self.info.backup_time
 	def _pn(self):
 		self.list_type = ListType()
-		self.dest = NullDevice()
+		# self.dest = NullDevice()
+		self.dest = self.output
 
 
 	def toggle(self, word, param):
