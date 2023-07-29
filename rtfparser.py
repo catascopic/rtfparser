@@ -275,7 +275,6 @@ class Parser:
 		elif word == 'plain':
 			self.reset(CHRFMT)
 			self.prop['f'] = self.deff
-		# use actual font obj?
 		elif word == 'rtf':
 			self.dest = self.output
 		elif word == 'fonttbl':
