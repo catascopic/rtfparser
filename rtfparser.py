@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 
 # TODO: \upr, \ud
@@ -20,13 +20,16 @@ else:
 	file = Path('test.rtf')
 
 ASCII = 'ascii'
-CHARSETS = {'ansi', 'mac', 'pc', 'pca'}
-FONT_FAMILIES = {
+
+CHARSETS = frozenset({'ansi', 'mac', 'pc', 'pca'})
+
+FONT_FAMILIES = frozenset({
 	'fnil', 'froman', 'fswiss', 'fmodern', 
 	'fscript', 'fdecor', 'ftech', 'fbidi'
-}
+})
+
 # Paragraph formatting (reset with \pard)
-PARFMT = {
+PARFMT = frozenset({
 	's', 'hyphpar', 'intbl', 'keep', 'nowidctlpar', 'widctlpar', 
 	'keepn', 'level', 'noline', 'outlinelevel', 'pagebb', 'sbys',
 	# use q to keep track of alignment
@@ -39,21 +42,22 @@ PARFMT = {
 	'subdocument',
 	# Bidirectional
 	'rtlpar', 'ltrpar',
-}
+})
 
 # Character formatting (reset with \plain)
-TOGGLE = {'b', 'caps', 'deleted', 'i', 'outl', 'scaps', 'shad', 'strike', 'ul', 'v'}  # hyphpar
-CHRFMT = {
+TOGGLE = frozenset({'b', 'caps', 'deleted', 'i', 'outl',
+                    'scaps', 'shad', 'strike', 'ul', 'v'})  # hyphpar
+CHRFMT = frozenset({
 	'animtext', 'charscalex', 'dn', 'embo', 'impr', 'sub', 'expnd', 'expndtw',
 	'kerning', 'f', 'fs', 'strikedl', 'up', 'super', 'cf', 'cb', 'rtlch',
-	'ltrch', 'cs', 'cchs', 'lang',
-} | TOGGLE
+	'ltrch', 'cs', 'cchs', 'lang'} | TOGGLE)
 
 # TABS = { ... }
 
-TIME_UNITS = {'yr', 'mo', 'dy', 'hr', 'min', 'sec'}
-INFO_PROPS = {'version', 'edmins', 'nofpages', 'nofwords', 'word_count', 'nofchars', 'nofcharsws'}
+TIME_UNITS = frozenset({'yr', 'mo', 'dy', 'hr', 'min', 'sec'})
 
+INFO_PROPS = frozenset({'version', 'edmins', 'nofpages', 'nofwords',
+                        'word_count', 'nofchars', 'nofcharsws'})
 ESCAPE = {
 	'line':      '\n',
 	'tab':       '\t',
@@ -72,31 +76,40 @@ SPECIAL = {
 	b'_': u'\u2011',  # nonbreaking hyphen
 }
 
-META_CHARS = {b'\\', b'{', b'}'}
+# can't do frozenset(b'\\{}') because iterating bytes gives you ints
+META_CHARS = frozenset({b'\\', b'{', b'}'})
 
-IGNORE_WORDS = {'nouicompat', 'viewkind'}
+IGNORE_WORDS = frozenset({'nouicompat', 'viewkind'})
 
 
 class Destination(ABC):
 
 	def write(self, text):
-		return NotImplemented
+		raise ValueError(f"{type(self)} can't handle text: {text}")
 
 	def par(self):
-		self.write('\n')
+		raise ValueError(f"{type(self)} can't handle paragraphs")
 	
 	def page_break(self):
-		pass
+		raise ValueError(f"{type(self)} can't handle page breaks")
 	
 	def close(self):
 		pass
 
 
-@dataclass
+class NullDevice(Destination):
+	def write(self, text):
+		pass  # do nothing
+
+
+NULL_DEVICE = NullDevice()
+
+
+@dataclass(frozen=True)
 class Font:
 	name: str
 	family: str
-	charset: str
+	charset: Optional[str]
 
 
 class FontTable(Destination):
@@ -116,7 +129,7 @@ class FontTable(Destination):
 			self.name = []
 
 
-@dataclass		
+@dataclass(frozen=True)
 class Color:
 	red: int
 	green: int
@@ -139,7 +152,7 @@ class ColorTable(Destination):
 				self.doc.prop.get('green', 0),
 				self.doc.prop.get('blue', 0)))
 		else:
-			raise ValueError(text)
+			raise ValueError(f"{text} in color table")
 
 
 class TextDest(Destination):
@@ -148,14 +161,13 @@ class TextDest(Destination):
 		self.content = []
 	
 	def write(self, text):
-		self.content.append(text);
-	
-	@property
-	def text(self):
+		self.content.append(text)
+
+	def get_text(self):
 		return ''.join(self.content)
 
 
-@dataclass
+@dataclass(frozen=True)
 class TimeDest(Destination):
 	yr: int = 0
 	mo: int = 0
@@ -164,36 +176,33 @@ class TimeDest(Destination):
 	min: int = 0
 	sec: int = 0
 
-	@property
-	def date(self):
+	def to_date(self):
 		return datetime(self.yr, self.mo, self.dy, self.hr, self.min, self.sec)
 
 
 class Info(Destination):
+
 	def __init__(self):
-		self.title = TextDest()
-		self.subject = TextDest()
+		# self.title = TextDest()
+		# self.subject = TextDest()
 		self.author = TextDest()
-		self.manager = TextDest()
-		self.company = TextDest()
-		self.operator = TextDest()
-		self.category = TextDest()
-		self.keywords = TextDest()
-		self.comment = NullDevice()
-		self.doccomm = TextDest()
+		# self.manager = TextDest()
+		# self.company = TextDest()
+		# self.operator = TextDest()
+		# self.category = TextDest()
+		# self.keywords = TextDest()
+		# self.comment = TextDest()
+		# self.doccomm = TextDest()
 		self.create_time = TimeDest()
 		self.revision_time = TimeDest()
 		self.print_time = TimeDest()
 		self.backup_time = TimeDest()
 
 
-class NullDevice(Destination):
-	def write(self, text):
-		pass  # do nothing
+class ListType:
 
-
-class ListType():
-	pass
+	def __init__(self):
+		self.level = 0
 
 
 def noop():
@@ -202,16 +211,18 @@ def noop():
 
 @dataclass
 class Group:
-	parent: Group
+	parent: Optional[Group]
 	dest: Destination
 	prop: dict[str, int | bool]
+	# TODO: wait, what is the point of this?
 	on_close: Callable[[], None] = noop
 
 	@classmethod
 	def root(cls):
-		return cls(None, NullDevice(), {})
+		return cls(None, NULL_DEVICE, {})
 
 	def make_child(self):
+		# TODO: chain map? if so have to use set None instead of pop everywhere
 		return Group(self, self.dest, self.prop.copy())
 
 
@@ -275,7 +286,7 @@ def skip_chars(f, n):
 				consume_end(f)
 			elif f.read(1) == b"'":
 				f.read(2)
-	
+
 
 class Parser:
 
@@ -352,11 +363,11 @@ class Parser:
 			self.prop['ul'] = word[2:]
 		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl'}:
 			# these destinations are unsupported
-			self.dest = NullDevice()
+			self.dest = NULL_DEVICE
 		elif word in CHARSETS:
 			self.charset = word
 		elif word in FONT_FAMILIES:
-			# this property name is made up
+			# this property name is made up, maybe use sentinel object instead?
 			self.prop['family'] = word[1:]
 		elif word in TIME_UNITS:
 			if isinstance(self.dest, TimeDest):
@@ -365,59 +376,6 @@ class Parser:
 				raise ValueError(f"cannot set time unit {word} for {self.dest} ({type(self.dest)})")
 		elif word not in IGNORE_WORDS:
 			self.prop[word] = param
-
-	# INSTRUCTION TABLE
-	
-	def _par(self):
-		self.dest.par()
-	def _page(self):
-		self.dest.page_break()
-	def _ql(self):
-		self.prop.pop('q', None)
-	def _ulnone(self):
-		self.prop.pop('ul', None)
-	def _nosupersub(self):
-		self.prop.pop('super', None)
-		self.prop.pop('sub', None)
-	def _nowidctlpar(self):
-		self.prop.pop('widctlpar', None)
-	def _pard(self):
-		self.reset(PARFMT)
-		self.list_type = None
-	def _plain(self):
-		self.reset(CHRFMT)
-		# use actual font obj?
-		self.prop['f'] = self.deff
-	def _rtf(self, a):
-		self.dest = self.output
-		self.rtf_version = a
-	def _fonttbl(self):
-		self.dest = self.font_table
-	def _colortbl(self):
-		self.dest = self.color_table
-	def _pntext(self):
-		self.dest = self.output if self.plain_text else NullDevice()
-	def _deff(self, a):
-		self.deff = self.prop['f'] = a
-	def _pnlvlblt(self):
-		pass
-	def _info(self):
-		self.dest = self.info
-	def _author(self):
-		self.dest = self.info.author
-	def _creatim(self):
-		self.dest = self.info.create_time
-	def _revtim(self):
-		self.dest = self.info.revision_time
-	def _printim(self):
-		self.dest = self.info.print_time
-	def _buptim(self):
-		self.dest = self.info.backup_time
-	def _pn(self):
-		self.list_type = ListType()
-		# self.dest = NullDevice()
-		self.dest = self.output
-
 
 	def toggle(self, word, param):
 		if param == 0:
@@ -428,7 +386,7 @@ class Parser:
 	def reset(self, properties):
 		for name in properties:
 			self.prop.pop(name, None)
-	
+
 	def try_read_dest(self, f):
 		read_while(f, lambda c: c in b'\r\n')
 		c = f.read(1)
@@ -438,7 +396,7 @@ class Parser:
 		if instr := getattr(self, '_' + word, None):
 			instr()
 		else:
-			self.dest = NullDevice()
+			self.dest = NULL_DEVICE
 
 	@property
 	def prop(self):
@@ -452,6 +410,108 @@ class Parser:
 	def dest(self, value):
 		self.group.dest = value
 		self.group.on_close = self.dest.close
+
+	# INSTRUCTION TABLE: Methods prefixed with an underscore correspond to RTF control words, which we'll look up at
+	# runtime. This may not be ideal, but it's the simplest way. Alternatively, create a "controlword" decorator which
+	# adds the function to a dict of valid control words.
+
+	def _par(self):
+		self.dest.par()
+
+	def _page(self):
+		self.dest.page_break()
+
+	def _ql(self):
+		self.prop.pop('q', None)
+
+	def _ulnone(self):
+		self.prop.pop('ul', None)
+
+	def _nosupersub(self):
+		self.prop.pop('super', None)
+		self.prop.pop('sub', None)
+
+	def _nowidctlpar(self):
+		self.prop.pop('widctlpar', None)
+
+	def _pard(self):
+		self.reset(PARFMT)
+		self.list_type = None
+
+	def _plain(self):
+		self.reset(CHRFMT)
+		# use actual font obj?
+		self.prop['f'] = self.deff
+
+	def _rtf(self, a):
+		self.dest = self.output
+		self.rtf_version = a
+
+	def _fonttbl(self):
+		self.dest = self.font_table
+
+	def _colortbl(self):
+		self.dest = self.color_table
+
+	def _pntext(self):
+		self.dest = self.output if self.plain_text else NULL_DEVICE
+
+	def _deff(self, a):
+		self.deff = self.prop['f'] = a
+
+	def _info(self):
+		self.dest = self.info
+
+	# title, subject, manager, company, operator, category, keywords, comment, doccomm, hlinkbase
+
+	def _author(self):
+		self.dest = self.info.author
+
+	def _creatim(self):
+		self.dest = self.info.create_time
+
+	def _revtim(self):
+		self.dest = self.info.revision_time
+
+	def _printim(self):
+		self.dest = self.info.print_time
+
+	def _buptim(self):
+		self.dest = self.info.backup_time
+
+	def _pn(self):
+		plist = ListType()
+		self.list_type = plist
+		self.dest = plist
+
+	def _pnlvl(self, n):
+		self.list_type.level = n
+
+	def _pnlvlbody(self):
+		self._pnlvl(10)
+
+	def _pnlvlblt(self):
+		self._pnlvl(11)
+
+	def _pnindent(self, n):
+		pass
+
+	def _pntxta(self):
+		# TODO: DOES THE GROUP CLOSE THE DEST?
+		self.dest = TextDest()
+
+	def _pntextb(self):
+		doc = self
+
+		class SetTextBefore(TextDest):
+			def close(self):
+				doc.list_type.before = self.get_text()
+
+		self.dest = SetTextBefore()
+
+	def _result(self):
+		# TODO: handle objects?
+		self.dest = NULL_DEVICE
 
 
 class Output(Destination):
@@ -526,22 +586,22 @@ class Recorder(Output):
 		#  print(text, end='')
 		self.full_text.append(text)
 
+	def par(self):
+		self.write('\n')
 
-rtf = Parser(Recorder)
+	def page_break(self):
+		pass
+
+
+rtf = Parser(Recorder, plain_text=True)
 rtf.parse(file)
 
 
 # print([f.name for f in rtf.font_table.fonts.values()])
 full_text = ''.join(rtf.output.full_text)
+print(full_text)
 # (?:[^\W_]|['‘’\-])
 WORDS = re.compile(r"[^\W_][\w'‘’\-]*")
 words = WORDS.findall(full_text)
-print(' '.join([w for w, c in Counter(w.lower().strip("'‘’") for w in words).items() if c == 1][-24:]))
 print(f'words: {len(words)}, chars: {len(full_text)}')
-mark = full_text.rfind('^')
-if mark != -1:
-	print('since mark:', len(WORDS.findall(full_text[mark + 1:])))
 
-bad_quote_words = re.findall(r"\S+['\"]\S+", full_text)
-if bad_quote_words:
-	print('BAD QUOTES:', ' '.join(bad_quote_words))
