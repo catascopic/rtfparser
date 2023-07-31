@@ -5,10 +5,9 @@ import sys
 
 from abc import ABC
 from dataclasses import dataclass
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 
 # TODO: \upr, \ud
@@ -17,7 +16,7 @@ from typing import Callable, Optional
 if len(sys.argv) > 1:
 	file = Path(sys.argv[1])
 else:
-	file = Path('test.rtf')
+	file = Path(r'test.rtf')
 
 ASCII = 'ascii'
 
@@ -32,16 +31,11 @@ FONT_FAMILIES = frozenset({
 PARFMT = frozenset({
 	's', 'hyphpar', 'intbl', 'keep', 'nowidctlpar', 'widctlpar', 
 	'keepn', 'level', 'noline', 'outlinelevel', 'pagebb', 'sbys',
-	# use q to keep track of alignment
-	'q',
-	# Indentation
-	'fi', 'li', 'ri',
-	# Spacing
-	'sb', 'sa', 'sl', 'slmult',
-	# Subdocuments
+	'q',  # use q to keep track of alignment
+	'fi', 'li', 'ri',  # indentation
+	'sb', 'sa', 'sl', 'slmult',  # spacing
 	'subdocument',
-	# Bidirectional
-	'rtlpar', 'ltrpar',
+	'rtlpar', 'ltrpar',  # direction
 })
 
 # Character formatting (reset with \plain)
@@ -54,10 +48,18 @@ CHRFMT = frozenset({
 
 # TABS = { ... }
 
-TIME_UNITS = frozenset({'yr', 'mo', 'dy', 'hr', 'min', 'sec'})
+# TIME_UNITS = frozenset({'yr', 'mo', 'dy', 'hr', 'min', 'sec'})
 
 INFO_PROPS = frozenset({'version', 'edmins', 'nofpages', 'nofwords',
                         'word_count', 'nofchars', 'nofcharsws'})
+
+TEXT_INFO = frozenset({'title', 'subject', 'author', 'manager', 'company', 'operator',
+                       'category', 'keywords', 'comment', 'doccomm', 'hlinkbase'})
+DATE_INFO = frozenset({'creatim', 'revtim', 'printim', 'buptim'})
+
+LIST_STYLES = frozenset({'pncard', 'pndec', 'pnucltr', 'pnucrm',
+                         'pnlcltr', 'pnlcrm', 'pnord', 'pnordt'})
+
 ESCAPE = {
 	'line':      '\n',
 	'tab':       '\t',
@@ -80,6 +82,7 @@ SPECIAL = {
 META_CHARS = frozenset({b'\\', b'{', b'}'})
 
 IGNORE_WORDS = frozenset({'nouicompat', 'viewkind'})
+UNSUPPORTED_DEST = frozenset({'filetbl', 'stylesheet', 'listtables', 'revtbl'})
 
 
 class Destination(ABC):
@@ -103,6 +106,13 @@ class NullDevice(Destination):
 
 
 NULL_DEVICE = NullDevice()
+
+
+class RootDest(Destination):
+	# TODO: in theory this should only allow one write
+	def write(self, text):
+		if text != '\u0000':
+			raise ValueError(f"expected NUL but got {text}")
 
 
 @dataclass(frozen=True)
@@ -155,75 +165,110 @@ class ColorTable(Destination):
 			raise ValueError(f"{text} in color table")
 
 
-class TextDest(Destination):
+class ListType(Destination):
 
-	def __init__(self):
+	def __init__(self, doc: Parser):
+		self.doc = doc
+		self.style = None
+		self.level = 0
+		self.before = None
+		self.after = None
+		self.font_index = 0
+		self.indent = 0
+		self.start = 1
+
+	def close(self):
+		self.font_index = self.doc.prop.get('pnf', 0)
+		self.start = self.doc.prop.get('pnstart', 1)
+		self.indent = self.doc.prop.get('pnindent', 0)
+
+	@property
+	def font(self):
+		return self.doc.font_table.fonts[self.font_index]
+
+
+class SetValue(Destination, ABC):
+
+	def __init__(self, obj, prop):
+		self.obj = obj
+		self.prop = prop
+
+	def get_value(self):
+		raise NotImplementedError
+
+	def close(self):
+		setattr(self.obj, self.prop, self.get_value())
+
+
+class TextSetter(SetValue):
+
+	def __init__(self, obj, prop):
+		super().__init__(obj, prop)
 		self.content = []
-	
+
 	def write(self, text):
 		self.content.append(text)
 
-	def get_text(self):
+	def get_value(self):
 		return ''.join(self.content)
 
 
-@dataclass(frozen=True)
-class TimeDest(Destination):
-	yr: int = 0
-	mo: int = 0
-	dy: int = 0
-	hr: int = 0
-	min: int = 0
-	sec: int = 0
+class TimeSetter(SetValue):
 
-	def to_date(self):
-		return datetime(self.yr, self.mo, self.dy, self.hr, self.min, self.sec)
+	def __init__(self, doc, obj, prop):
+		super().__init__(obj, prop)
+		self.doc = doc
+
+	def get_value(self):
+		return datetime(*(self.doc.prop[k] for k in ['yr', 'mo', 'dy', 'hr', 'min', 'sec']))
 
 
-class Info(Destination):
-
-	def __init__(self):
-		# self.title = TextDest()
-		# self.subject = TextDest()
-		self.author = TextDest()
-		# self.manager = TextDest()
-		# self.company = TextDest()
-		# self.operator = TextDest()
-		# self.category = TextDest()
-		# self.keywords = TextDest()
-		# self.comment = TextDest()
-		# self.doccomm = TextDest()
-		self.create_time = TimeDest()
-		self.revision_time = TimeDest()
-		self.print_time = TimeDest()
-		self.backup_time = TimeDest()
-
-
-class ListType:
-
-	def __init__(self):
-		self.level = 0
-
-
-def noop():
-	pass
+@dataclass
+class Info:
+	title: str = None
+	subject: str = None
+	author: str = None
+	manager: str = None
+	company: str = None
+	operator: str = None
+	category: str = None
+	keywords: str = None
+	comment: str = None
+	doccomm: str = None
+	hlinkbase: str = None
+	creatim: datetime = None
+	revtim: datetime = None
+	printim: datetime = None
+	buptim: datetime = None
 
 
 @dataclass
 class Group:
 	parent: Optional[Group]
-	dest: Destination
-	prop: dict[str, int | bool]
-	# TODO: wait, what is the point of this?
-	on_close: Callable[[], None] = noop
+	own_dest: Optional[Destination]
+	# TODO: string values OK?
+	prop: dict[str, str | int | bool]
 
 	@classmethod
 	def root(cls):
-		return cls(None, NULL_DEVICE, {})
+		return cls(None, RootDest(), {})
 
-	def make_child(self):
+	def open(self):
 		# TODO: chain map? if so have to use set None instead of pop everywhere
-		return Group(self, self.dest, self.prop.copy())
+		return Group(self, None, self.prop.copy())
+
+	@property
+	def dest(self):
+		return self.own_dest or self.parent.dest
+
+	@dest.setter
+	def dest(self, value):
+		self.own_dest = value
+
+	def close(self):
+		if self.own_dest is not None:
+			self.own_dest.close()
+		return self.parent
 
 
 def not_control(c):
@@ -311,10 +356,9 @@ class Parser:
 				if c == b'\\':
 					self.read_control(f)
 				elif c == b'{':
-					self.group = self.group.make_child()
+					self.group = self.group.open()
 				elif c == b'}':
-					self.dest.close()
-					self.group = self.group.parent
+					self.group = self.group.close()
 				else:
 					# must be EOF
 					break
@@ -325,7 +369,7 @@ class Parser:
 			if s := ESCAPE.get(word):
 				self.dest.write(s)
 			else:
-				param = read_number(f, True)
+				param = read_number(f)
 				# handle \u separately because it advances the reader
 				if word == 'u':
 					self.dest.write(chr(param))
@@ -351,37 +395,45 @@ class Parser:
 			else:
 				raise ValueError(f"{c} at {f.tell()}")
 	
-	def control(self, word, param):	
+	def control(self, word: str, param: Optional[int]):
 		if instr := getattr(self, '_' + word, None):
-			args = (param,) if type(param) is int else ()
-			instr(*args)
-		elif word in TOGGLE:
+			if param is None:
+				instr()
+			else:
+				instr(param)
+			return
+
+		if param is None:
+			param = True
+
+		if word in TOGGLE:
 			self.toggle(word, param)
 		elif word.startswith('q'):  # alignment
 			self.prop['q'] = word[1:]
 		elif word.startswith('ul'):
-			self.prop['ul'] = word[2:]
-		elif word in {'filetbl', 'stylesheet', 'listtables', 'revtbl'}:
-			# these destinations are unsupported
+			self.prop['ul'] = word[2:] or True
+		elif word in LIST_STYLES:
+			self.list_type.style = word
+		elif word in UNSUPPORTED_DEST:
 			self.dest = NULL_DEVICE
 		elif word in CHARSETS:
 			self.charset = word
 		elif word in FONT_FAMILIES:
 			# this property name is made up, maybe use sentinel object instead?
 			self.prop['family'] = word[1:]
-		elif word in TIME_UNITS:
-			if isinstance(self.dest, TimeDest):
-				setattr(self.dest, word, param)
-			else:
-				raise ValueError(f"cannot set time unit {word} for {self.dest} ({type(self.dest)})")
+		elif word in TEXT_INFO:
+			self.dest = TextSetter(self.info, word)
+		elif word in DATE_INFO:
+			self.dest = TimeSetter(self, self.info, word)
 		elif word not in IGNORE_WORDS:
 			self.prop[word] = param
+		# else: pass  # ignore
 
-	def toggle(self, word, param):
-		if param == 0:
+	def toggle(self, word: str, param):
+		if not param:
 			self.prop.pop(word, None)
 		else:
-			self.prop[word] = param
+			self.prop[word] = True
 
 	def reset(self, properties):
 		for name in properties:
@@ -409,7 +461,6 @@ class Parser:
 	@dest.setter
 	def dest(self, value):
 		self.group.dest = value
-		self.group.on_close = self.dest.close
 
 	# INSTRUCTION TABLE: Methods prefixed with an underscore correspond to RTF control words, which we'll look up at
 	# runtime. This may not be ideal, but it's the simplest way. Alternatively, create a "controlword" decorator which
@@ -456,33 +507,16 @@ class Parser:
 	def _pntext(self):
 		self.dest = self.output if self.plain_text else NULL_DEVICE
 
-	def _deff(self, a):
-		self.deff = self.prop['f'] = a
+	def _deff(self, n):
+		self.deff = self.prop['f'] = n
 
 	def _info(self):
 		self.dest = self.info
 
-	# title, subject, manager, company, operator, category, keywords, comment, doccomm, hlinkbase
-
-	def _author(self):
-		self.dest = self.info.author
-
-	def _creatim(self):
-		self.dest = self.info.create_time
-
-	def _revtim(self):
-		self.dest = self.info.revision_time
-
-	def _printim(self):
-		self.dest = self.info.print_time
-
-	def _buptim(self):
-		self.dest = self.info.backup_time
+	# LISTS
 
 	def _pn(self):
-		plist = ListType()
-		self.list_type = plist
-		self.dest = plist
+		self.dest = self.list_type = ListType(self)
 
 	def _pnlvl(self, n):
 		self.list_type.level = n
@@ -493,21 +527,11 @@ class Parser:
 	def _pnlvlblt(self):
 		self._pnlvl(11)
 
-	def _pnindent(self, n):
-		pass
+	def _pntxtb(self):
+		self.dest = TextSetter(self.list_type, 'before')
 
 	def _pntxta(self):
-		# TODO: DOES THE GROUP CLOSE THE DEST?
-		self.dest = TextDest()
-
-	def _pntextb(self):
-		doc = self
-
-		class SetTextBefore(TextDest):
-			def close(self):
-				doc.list_type.before = self.get_text()
-
-		self.dest = SetTextBefore()
+		self.dest = TextSetter(self.list_type, 'after')
 
 	def _result(self):
 		# TODO: handle objects?
@@ -566,8 +590,26 @@ class Output(Destination):
 	@property
 	def font_size(self):
 		return self.prop['fs']
+
+	@property
+	def list_type(self):
+		return self._doc.list_type
 	
 	# TODO: line spacing?
+
+
+def diff_prop(old, new):
+	diffs = []
+	for k in old.keys() & new.keys():
+		oldval = old[k]
+		newval = new[k]
+		if oldval != newval:
+			diffs.append(f"{k}: {oldval}->{newval}")
+	for k in old.keys() - new.keys():
+		diffs.append(f"{k}: -{old[k]}")
+	for k in new.keys() - old.keys():
+		diffs.append(f"{k}: +{new[k]}")
+	return '; '.join(diffs)
 
 
 class Recorder(Output):
@@ -576,24 +618,25 @@ class Recorder(Output):
 		super().__init__(doc)
 		self.full_text = []
 		self.last_prop = {}
+		self.styles = set()
 
 	def write(self, text):
 		if self.prop != self.last_prop:
-			# print()
-			# print('-', self.last_prop.items() - self.prop.items())
-			# print('+', self.prop.items() - self.last_prop.items())
+			print(diff_prop(self.last_prop, self.prop))
 			self.last_prop = self.prop.copy()
+			self.styles.add(frozenset((k, v) for k, v in self.prop.items() if k in PARFMT or k in CHRFMT))
 		#  print(text, end='')
+		print(text)
 		self.full_text.append(text)
 
 	def par(self):
-		self.write('\n')
+		self.full_text.append('\n')
 
 	def page_break(self):
 		pass
 
 
-rtf = Parser(Recorder, plain_text=True)
+rtf = Parser(Recorder)
 rtf.parse(file)
 
 
@@ -605,3 +648,14 @@ WORDS = re.compile(r"[^\W_][\w'‘’\-]*")
 words = WORDS.findall(full_text)
 print(f'words: {len(words)}, chars: {len(full_text)}')
 
+it = iter(rtf.output.styles)
+common = set(next(it))
+for s in it:
+	common = common.intersection(s)
+
+print('COMMON:', common)
+
+styles = [dict(s) for s in rtf.output.styles]
+
+for s in rtf.output.styles:
+	print(dict(s - common))
