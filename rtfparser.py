@@ -1,22 +1,16 @@
 from __future__ import annotations
 
-import re
-import sys
+import os
+import struct
+
+import rtfcharset
 
 from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
+from typing import Optional, BinaryIO, Iterable
 
-
-# TODO: \upr, \ud
-
-
-if len(sys.argv) > 1:
-	file = Path(sys.argv[1])
-else:
-	file = Path(r'test.rtf')
+# TODO: \upr, \ud (these are only used for not-output destinations)
 
 ASCII = 'ascii'
 
@@ -47,8 +41,6 @@ CHRFMT = frozenset({
 	'ltrch', 'cs', 'cchs', 'lang'} | TOGGLE)
 
 # TABS = { ... }
-
-# TIME_UNITS = frozenset({'yr', 'mo', 'dy', 'hr', 'min', 'sec'})
 
 INFO_PROPS = frozenset({'version', 'edmins', 'nofpages', 'nofwords',
                         'word_count', 'nofchars', 'nofcharsws'})
@@ -119,14 +111,15 @@ class RootDest(Destination):
 class Font:
 	name: str
 	family: str
-	charset: Optional[str]
+	# these charsets are Windows-dependent, we'll mostly ignore them
+	charset: Optional[str] = None
 
 
 class FontTable(Destination):
 
 	def __init__(self, doc):
 		self.doc = doc
-		self.fonts = {}
+		self.fonts: dict[int, Font] = {}
 		self.name = []
 
 	def write(self, text):
@@ -153,16 +146,14 @@ class ColorTable(Destination):
 	
 	def __init__(self, doc):
 		self.doc = doc
-		self.colors = []
+		self.colors: list[Color] = []
 
 	def write(self, text):
-		if text == ';':
-			self.colors.append(Color(
-				self.doc.prop.get('red', 0),
-				self.doc.prop.get('green', 0),
-				self.doc.prop.get('blue', 0)))
-		else:
-			raise ValueError(f"{text} in color table")
+		# if text != ';': WARN
+		self.colors.append(Color(
+			self.doc.prop.get('red', 0),
+			self.doc.prop.get('green', 0),
+			self.doc.prop.get('blue', 0)))
 
 
 class ListType(Destination):
@@ -173,7 +164,7 @@ class ListType(Destination):
 		self.level = 0
 		self.before = None
 		self.after = None
-		self.font_index = 0
+		self.font_index = None
 		self.indent = 0
 		self.start = 1
 
@@ -184,7 +175,12 @@ class ListType(Destination):
 
 	@property
 	def font(self):
-		return self.doc.font_table.fonts[self.font_index]
+		index = self.font_index
+		if index is None:
+			index = self.doc.prop['f']
+			if index is None:
+				index = self.doc.deff
+		return self.doc.font_table.fonts[index]
 
 
 class SetValue(Destination, ABC):
@@ -220,7 +216,8 @@ class TimeSetter(SetValue):
 		self.doc = doc
 
 	def get_value(self):
-		return datetime(*(self.doc.prop[k] for k in ['yr', 'mo', 'dy', 'hr', 'min', 'sec']))
+		return datetime(*(self.doc.prop[k] for k in ('yr', 'mo', 'dy')),
+		                *(self.doc.prop.get(k, 0) for k in ('hr', 'min', 'sec')))
 
 
 @dataclass
@@ -246,7 +243,7 @@ class Info:
 class Group:
 	parent: Optional[Group]
 	own_dest: Optional[Destination]
-	# TODO: string values OK?
+	# TODO: do we want to include string values here?
 	prop: dict[str, str | int | bool]
 
 	@classmethod
@@ -254,7 +251,8 @@ class Group:
 		return cls(None, RootDest(), {})
 
 	def open(self):
-		# TODO: chain map? if so have to use set None instead of pop everywhere
+		# could use ChainMap here, but we'd have to replace pop() with setting to None.
+		# this would be a big pain when resetting properties.
 		return Group(self, None, self.prop.copy())
 
 	@property
@@ -346,7 +344,7 @@ class Parser:
 		self.deff = None
 		self.rtf_version = None
 
-	def parse(self, file):
+	def parse(self, file: str | bytes | os.PathLike):
 		with open(file, 'rb') as f:
 			while True:
 				text = read_while(f, not_control).translate(None, b'\r\n').decode(ASCII)
@@ -363,39 +361,63 @@ class Parser:
 					# must be EOF
 					break
 
-	def read_control(self, f):
+	def read_control(self, f: BinaryIO):
 		word = read_word(f)
 		if word:
-			if s := ESCAPE.get(word):
-				self.dest.write(s)
+			if esc := ESCAPE.get(word):
+				consume_end(f)
+				self.dest.write(esc)
 			else:
 				param = read_number(f)
-				# handle \u separately because it advances the reader
+				consume_end(f)
+				# \u is sort of a control word but we handle it separately because it advances the reader
 				if word == 'u':
-					self.dest.write(chr(param))
-					# we can always handle unicode
-					skip_chars(f, self.prop.get('uc', 1))
+					self.read_unicode(f, param)
 				else:
-					self.control(word, param)
-			consume_end(f)
+					self.handle_control(word, param)
 		else:
 			c = f.read(1)
 			# using bytes rather than strings here!
 			if c == b"'":
-				# can python handle charsets other than ansi?
-				self.dest.write(bytes([int(f.read(2), 16)]).decode(self.charset))
+				encoding = rtfcharset.get_encoding(self.current_font.charset, self.charset)
+				self.dest.write(bytes([int(f.read(2), 16)]).decode(encoding))
 			elif c in META_CHARS:
 				self.dest.write(c.decode(ASCII))
-			elif s := SPECIAL.get(c):
-				self.dest.write(s)
+			elif special := SPECIAL.get(c):
+				self.dest.write(special)
 			elif c == b'\r' or c == b'\n':
 				self.dest.par()
 			elif c == b'*':
 				self.try_read_dest(f)
 			else:
 				raise ValueError(f"{c} at {f.tell()}")
-	
-	def control(self, word: str, param: Optional[int]):
+
+	def read_unicode(self, f: BinaryIO, param: int):
+		# rtf params are supposed to be signed 16-bit, so convert to their unsigned value.
+		# we'll accept any positive number, though.
+		unsigned = param if param >= 0 else param % 0x10000
+		if 0xD800 < unsigned < 0xDBFF:  # high surrogate
+			self.skip_replacement(f)
+			self.consume(f, b"\\u")
+			# ensure low surrogate?
+			next_code = read_number(f)
+			consume_end(f)
+			self.dest.write(struct.pack('hh', param, next_code).decode('utf-16-le'))
+		else:
+			self.dest.write(chr(unsigned))
+
+		# we can always handle unicode
+		self.skip_replacement(f)
+
+	def skip_replacement(self, f: BinaryIO):
+		skip_chars(f, self.prop.get('uc', 1))
+
+	def consume(self, f: BinaryIO, expected: bytes):
+		actual = f.read(len(expected))
+		if actual != expected:
+			raise ValueError(actual)
+
+	def handle_control(self, word: str, param: Optional[int]):
 		if instr := getattr(self, '_' + word, None):
 			if param is None:
 				instr()
@@ -414,6 +436,8 @@ class Parser:
 			self.prop['ul'] = word[2:] or True
 		elif word in LIST_STYLES:
 			self.list_type.style = word
+		elif word.startswith('pn'):
+			pass  # TODO: set list properties
 		elif word in UNSUPPORTED_DEST:
 			self.dest = NULL_DEVICE
 		elif word in CHARSETS:
@@ -429,17 +453,17 @@ class Parser:
 			self.prop[word] = param
 		# else: pass  # ignore
 
-	def toggle(self, word: str, param):
+	def toggle(self, word: str, param: Optional[int]):
 		if not param:
 			self.prop.pop(word, None)
 		else:
 			self.prop[word] = True
 
-	def reset(self, properties):
+	def reset(self, properties: Iterable[str]):
 		for name in properties:
 			self.prop.pop(name, None)
 
-	def try_read_dest(self, f):
+	def try_read_dest(self, f: BinaryIO):
 		read_while(f, lambda c: c in b'\r\n')
 		c = f.read(1)
 		if c != b'\\':
@@ -459,12 +483,33 @@ class Parser:
 		return self.group.dest
 
 	@dest.setter
-	def dest(self, value):
+	def dest(self, value: Destination):
 		self.group.dest = value
+
+	@property
+	def current_font(self):
+		return self.font_table.fonts[self.prop.get('f', self.deff)]
 
 	# INSTRUCTION TABLE: Methods prefixed with an underscore correspond to RTF control words, which we'll look up at
 	# runtime. This may not be ideal, but it's the simplest way. Alternatively, create a "controlword" decorator which
 	# adds the function to a dict of valid control words.
+
+	def _rtf(self, version=1):
+		self.dest = self.output
+		self.rtf_version = version
+
+	def _ansicpg(self, page):
+		# TODO: valid?
+		self.charset = f"cp{page}"
+
+	def _deff(self, n):
+		self.deff = n
+
+	def _fonttbl(self):
+		self.dest = self.font_table
+
+	def _colortbl(self):
+		self.dest = self.color_table
 
 	def _par(self):
 		self.dest.par()
@@ -494,24 +539,11 @@ class Parser:
 		# use actual font obj?
 		self.prop['f'] = self.deff
 
-	def _rtf(self, a):
-		self.dest = self.output
-		self.rtf_version = a
-
-	def _fonttbl(self):
-		self.dest = self.font_table
-
-	def _colortbl(self):
-		self.dest = self.color_table
-
 	def _pntext(self):
 		self.dest = self.output if self.plain_text else NULL_DEVICE
 
-	def _deff(self, n):
-		self.deff = self.prop['f'] = n
-
 	def _info(self):
-		self.dest = self.info
+		pass  # check for info group validity?
 
 	# LISTS
 
@@ -553,7 +585,7 @@ class Output(Destination):
 
 	@property
 	def font(self):
-		return self.fonts[self.prop['f']]
+		return self._doc.current_font
 
 	def get_color(self, i):
 		return BLACK if not self.colors else self.colors[i]
@@ -622,11 +654,11 @@ class Recorder(Output):
 
 	def write(self, text):
 		if self.prop != self.last_prop:
-			print(diff_prop(self.last_prop, self.prop))
+			# print(diff_prop(self.last_prop, self.prop))
 			self.last_prop = self.prop.copy()
 			self.styles.add(frozenset((k, v) for k, v in self.prop.items() if k in PARFMT or k in CHRFMT))
-		#  print(text, end='')
-		print(text)
+		# print(text, end='')
+		# print(text)
 		self.full_text.append(text)
 
 	def par(self):
@@ -636,26 +668,32 @@ class Recorder(Output):
 		pass
 
 
-rtf = Parser(Recorder)
-rtf.parse(file)
+if __name__ == '__main__':
+	import re
 
+	# print(bytes([0xe2]).decode('cp1253'))
 
-# print([f.name for f in rtf.font_table.fonts.values()])
-full_text = ''.join(rtf.output.full_text)
-print(full_text)
-# (?:[^\W_]|['‘’\-])
-WORDS = re.compile(r"[^\W_][\w'‘’\-]*")
-words = WORDS.findall(full_text)
-print(f'words: {len(words)}, chars: {len(full_text)}')
+	rtf = Parser(Recorder, True)
+	rtf.parse('generated.rtf')
 
-it = iter(rtf.output.styles)
-common = set(next(it))
-for s in it:
-	common = common.intersection(s)
+	# print([f.name for f in rtf.font_table.fonts.values()])
+	full_text = ''.join(rtf.output.full_text)
+	print(full_text)
+	# (?:[^\W_]|['‘’\-])
+	WORDS = re.compile(r"[^\W_][\w'‘’\-]*")
+	words = WORDS.findall(full_text)
+	print(f'words: {len(words)}, chars: {len(full_text)}')
 
-print('COMMON:', common)
+	it = iter(rtf.output.styles)
+	common = set(next(it))
+	for s in it:
+		common = common.intersection(s)
 
-styles = [dict(s) for s in rtf.output.styles]
+	print('COMMON:', common)
 
-for s in rtf.output.styles:
-	print(dict(s - common))
+	styles = [dict(s) for s in rtf.output.styles]
+
+	for s in rtf.output.styles:
+		print(dict(s - common))
+
+	print(hex(ord('Ꙕ')))
