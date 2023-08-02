@@ -10,20 +10,31 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, BinaryIO, Iterable, Callable
 
+# This parser makes a questionable, but I believe justified, decision to parse files in binary mode.
+# RTF files are pure ascii, so it sort of doesn't matter. Strings are generally easier to work with in python,
+# but using binary mode lets us call seek() on the reader, which is useful when we want to "peek" at the next token in
+# the stream. (We also get to use bytebuffer a few times and avoid having to do ''.join on lists of chars.)
+# The one awkward part is, in python, characters are 1-char strings, while individual bytes are just ints.
+# We don't want to use ints, because they make the code hard to read, so we instead use byte sequences of length 1.
+# This isn't ideal, but it's really the only downside to this paradigm (other than having to remember to start all your
+# strings with the b prefix).
+
 # TODO: \upr, \ud (these are only used for not-output destinations)
 
 ASCII = 'ascii'
 
-CHARSETS = frozenset({'ansi', 'mac', 'pc', 'pca'})
+CHARSETS = {
+	'ansi': 'ansi',
+	'pc':   'cp437',
+	'pca':  'cp850',
+	'mac':  'macintosh'
+}
 
-FONT_FAMILIES = frozenset({
-	'fnil', 'froman', 'fswiss', 'fmodern', 
-	'fscript', 'fdecor', 'ftech', 'fbidi'
-})
+FONT_FAMILIES = frozenset({'fnil', 'froman', 'fswiss', 'fmodern', 'fscript', 'fdecor', 'ftech', 'fbidi'})
 
 # Paragraph formatting (reset with \pard)
 PARFMT = frozenset({
-	's', 'hyphpar', 'intbl', 'keep', 'nowidctlpar', 'widctlpar', 
+	's', 'hyphpar', 'intbl', 'keep', 'nowidctlpar', 'widctlpar',
 	'keepn', 'level', 'noline', 'outlinelevel', 'pagebb', 'sbys',
 	'q',  # use q to keep track of alignment
 	'fi', 'li', 'ri',  # indentation
@@ -33,8 +44,7 @@ PARFMT = frozenset({
 })
 
 # Character formatting (reset with \plain)
-TOGGLE = frozenset({'b', 'caps', 'deleted', 'i', 'outl',
-                    'scaps', 'shad', 'strike', 'ul', 'v'})  # hyphpar
+TOGGLE = frozenset({'b', 'caps', 'deleted', 'i', 'outl', 'scaps', 'shad', 'strike', 'ul', 'v'})  # hyphpar
 CHRFMT = frozenset({
 	'animtext', 'charscalex', 'dn', 'embo', 'impr', 'sub', 'expnd', 'expndtw',
 	'kerning', 'f', 'fs', 'strikedl', 'up', 'super', 'cf', 'cb', 'rtlch',
@@ -42,15 +52,11 @@ CHRFMT = frozenset({
 
 # TABS = { ... }
 
-INFO_PROPS = frozenset({'version', 'edmins', 'nofpages', 'nofwords',
-                        'word_count', 'nofchars', 'nofcharsws'})
-
+INFO_PROPS = frozenset({'version', 'edmins', 'nofpages', 'nofwords', 'word_count', 'nofchars', 'nofcharsws'})
 TEXT_INFO = frozenset({'title', 'subject', 'author', 'manager', 'company', 'operator',
                        'category', 'keywords', 'comment', 'doccomm', 'hlinkbase'})
 DATE_INFO = frozenset({'creatim', 'revtim', 'printim', 'buptim'})
-
-LIST_STYLES = frozenset({'pncard', 'pndec', 'pnucltr', 'pnucrm',
-                         'pnlcltr', 'pnlcrm', 'pnord', 'pnordt'})
+LIST_STYLES = frozenset({'pncard', 'pndec', 'pnucltr', 'pnucrm', 'pnlcltr', 'pnlcrm', 'pnord', 'pnordt'})
 
 ESCAPE = {
 	'line':      '\n',
@@ -65,9 +71,9 @@ ESCAPE = {
 }
 
 SPECIAL = {
-	b'~': u'\u00A0',  # nonbreaking space
-	b'-': u'\u00AD',  # optional hyphen
-	b'_': u'\u2011',  # nonbreaking hyphen
+	b'~': '\u00A0',  # nonbreaking space
+	b'-': '\u00AD',  # optional hyphen
+	b'_': '\u2011',  # nonbreaking hyphen
 }
 
 # can't do frozenset(b'\\{}') because iterating bytes gives you ints
@@ -81,15 +87,15 @@ BytePredicate = Callable[[bytes], bool]
 
 class Destination(ABC):
 
-	def write(self, text):
+	def write(self, text: str):
 		raise ValueError(f"{type(self)} can't handle text: {text}")
 
 	def par(self):
 		raise ValueError(f"{type(self)} can't handle paragraphs")
-	
+
 	def page_break(self):
 		raise ValueError(f"{type(self)} can't handle page breaks")
-	
+
 	def close(self):
 		pass
 
@@ -113,22 +119,20 @@ class RootDest(Destination):
 class Font:
 	name: str
 	family: str
-	# these charsets are Windows-dependent, we'll mostly ignore them
 	charset: Optional[str] = None
 
 
 class FontTable(Destination):
 
-	def __init__(self, doc):
+	def __init__(self, doc: Parser):
 		self.doc = doc
-		self.fonts: dict[int, Font] = {}
 		self.name = []
 
 	def write(self, text):
 		self.name.append(text)
-		if text.endswith(';'):	
-			self.fonts[self.doc.prop['f']] = Font(
-				''.join(self.name)[:-1], 
+		if text.endswith(';'):
+			self.doc.fonts[self.doc.prop['f']] = Font(
+				''.join(self.name)[:-1],
 				self.doc.prop['family'],
 				self.doc.prop.get('fcharset'))
 			self.name = []
@@ -145,44 +149,34 @@ BLACK = Color(0, 0, 0)
 
 
 class ColorTable(Destination):
-	
-	def __init__(self, doc):
+
+	def __init__(self, doc: Parser):
 		self.doc = doc
-		self.colors: list[Color] = []
 
 	def write(self, text):
 		# if text != ';': WARN
-		self.colors.append(Color(
+		self.doc.colors.append(Color(
 			self.doc.prop.get('red', 0),
 			self.doc.prop.get('green', 0),
 			self.doc.prop.get('blue', 0)))
 
 
-class ListType(Destination):
+@dataclass
+class ListType:
+	style: str = None
+	level: int = 0
+	before: str = ''
+	after: str = ''
+	font_index: int = None
+	indent: int = 0
+	start: int = 1
 
-	def __init__(self, doc: Parser):
-		self.doc = doc
-		self.style = None
-		self.level = 0
-		self.before = None
-		self.after = None
-		self.font_index = None
-		self.indent = 0
-		self.start = 1
-
-	def close(self):
-		self.font_index = self.doc.prop.get('pnf', 0)
-		self.start = self.doc.prop.get('pnstart', 1)
-		self.indent = self.doc.prop.get('pnindent', 0)
-
-	@property
-	def font(self):
+	# TODO: move this somewhere else?
+	def font(self, doc: Parser):
 		index = self.font_index
 		if index is None:
-			index = self.doc.prop['f']
-			if index is None:
-				index = self.doc.deff
-		return self.doc.font_table.fonts[index]
+			index = doc.prop.get('f', doc.deff)
+		return doc.fonts[index]
 
 
 class SetValue(Destination, ABC):
@@ -342,7 +336,7 @@ def skip_chars(f: BinaryIO, n: int):
 				consume_end(f)
 			elif f.read(1) == b"'":
 				f.read(2)
-		elif c == b'{ or' or c == b'}':
+		elif c == b'{' or c == b'}':
 			f.seek(-1, 1)
 			return
 
@@ -351,10 +345,11 @@ class Parser:
 
 	def __init__(self, output, plain_text=False):
 		self.output = output(self)
-		self.font_table = FontTable(self)
-		self.color_table = ColorTable(self)
+		self.fonts: dict[int, Font] = {}
+		self.colors: list[Color] = []
 		self.info = Info()
 		self.group = Group.root()
+		self.list_type: Optional[ListType] = None
 		self.plain_text = plain_text
 		self.charset = 'ansi'
 		self.deff = None
@@ -410,12 +405,12 @@ class Parser:
 
 	def read_unicode(self, f: BinaryIO, param: int):
 		# rtf params are supposed to be signed 16-bit, so convert to their unsigned value.
-		# we'll accept any positive number, though.
+		# but we'll accept larger positive numbers if that's what's on offer
 		unsigned = param if param >= 0 else param + 0x10000
 		if 0xD800 < unsigned < 0xDBFF:
 			self.skip_replacement(f)
 			# in the case of a high surrogate, assume another \u follows
-			consume(f, b"\\u")
+			consume(f, b'\\u')
 			# ensure low surrogate?
 			low = read_number(f)
 			consume_end(f)
@@ -452,8 +447,8 @@ class Parser:
 			pass  # TODO: set list properties
 		elif word in UNSUPPORTED_DEST:
 			self.dest = NULL_DEVICE
-		elif word in CHARSETS:
-			self.charset = word
+		elif charset := CHARSETS.get(word):
+			self.charset = charset
 		elif word in FONT_FAMILIES:
 			# this property name is made up, maybe use sentinel object instead?
 			self.prop['family'] = word[1:]
@@ -498,7 +493,7 @@ class Parser:
 
 	@property
 	def current_font(self):
-		return self.font_table.fonts[self.prop.get('f', self.deff)]
+		return self.fonts[self.prop.get('f', self.deff)]
 
 	# INSTRUCTION TABLE: Methods prefixed with an underscore correspond to RTF control words, which we'll look up at
 	# runtime. This has downsides (theoretical name collision), but it is simple!
@@ -509,17 +504,16 @@ class Parser:
 		self.rtf_version = version
 
 	def _ansicpg(self, page):
-		# TODO: valid?
 		self.charset = f"cp{page}"
 
 	def _deff(self, n):
 		self.deff = n
 
 	def _fonttbl(self):
-		self.dest = self.font_table
+		self.dest = FontTable(self)
 
 	def _colortbl(self):
-		self.dest = self.color_table
+		self.dest = ColorTable(self)
 
 	def _par(self):
 		self.dest.par()
@@ -558,7 +552,16 @@ class Parser:
 	# LISTS
 
 	def _pn(self):
-		self.dest = self.list_type = ListType(self)
+		self.list_type = ListType()
+
+	def _pnf(self, n):
+		self.list_type.font_index = n
+
+	def _pnstart(self, n):
+		self.list_type.start = n
+
+	def _pnindent(self, n):
+		self.list_type.indent = n
 
 	def _pnlvl(self, n):
 		self.list_type.level = n
@@ -590,11 +593,11 @@ class Output(Destination):
 
 	def __init__(self, doc):
 		self._doc = doc
-	
+
 	@property
 	def prop(self):
 		return self._doc.prop
-	
+
 	@property
 	def fonts(self):
 		return self._doc.font_table.fonts
@@ -642,7 +645,7 @@ class Output(Destination):
 	@property
 	def list_type(self):
 		return self._doc.list_type
-	
+
 	# TODO: line spacing?
 
 
@@ -687,10 +690,8 @@ class Recorder(Output):
 if __name__ == '__main__':
 	import re
 
-	# print(bytes([0xe2]).decode('cp1253'))
-
-	rtf = Parser(Recorder, True)
-	rtf.parse('generated.rtf')
+	rtf = Parser(Recorder)
+	rtf.parse('test.rtf')
 
 	# print([f.name for f in rtf.font_table.fonts.values()])
 	full_text = ''.join(rtf.output.full_text)
@@ -711,5 +712,3 @@ if __name__ == '__main__':
 
 	for s in rtf.output.styles:
 		print(dict(s - common))
-
-	print(hex(ord('Ꙕ')))
