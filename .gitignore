@@ -1,2 +1,3 @@
 *.rtf
 .idea
+__pycache__
