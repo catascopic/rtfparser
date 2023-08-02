@@ -8,7 +8,7 @@ import rtfcharset
 from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, BinaryIO, Iterable
+from typing import Optional, BinaryIO, Iterable, Callable
 
 # TODO: \upr, \ud (these are only used for not-output destinations)
 
@@ -75,6 +75,8 @@ META_CHARS = frozenset({b'\\', b'{', b'}'})
 
 IGNORE_WORDS = frozenset({'nouicompat', 'viewkind'})
 UNSUPPORTED_DEST = frozenset({'filetbl', 'stylesheet', 'listtables', 'revtbl'})
+
+BytePredicate = Callable[[bytes], bool]
 
 
 class Destination(ABC):
@@ -269,26 +271,30 @@ class Group:
 		return self.parent
 
 
-def not_control(c):
+def not_control(c: bytes) -> bool:
 	return c not in META_CHARS
 
 
-# TODO: is mmathPr and other stuff actually valid RTF?
-def is_letter(c):
+def is_letter(c: bytes):
+	# control words are supposed to be lower case as per the spec, but in practice some have mixed case
 	return b'a' <= c <= b'z' or b'A' <= c <= b'Z'
 
 
-def is_digit(c):
+def is_digit(c: bytes):
 	return b'0' <= c <= b'9'
 
 
-def read_while(f, matcher):
+def is_endline(c: bytes):
+	return c == b'\r' or c == b'\n'
+
+
+def read_while(f: BinaryIO, matcher: BytePredicate):
 	buf = bytearray()
 	read_into_while(f, buf, matcher)
 	return buf
 
 
-def read_into_while(f, buf, matcher):
+def read_into_while(f: BinaryIO, buf: bytearray, matcher: BytePredicate):
 	while True:
 		c = f.read(1)
 		if not matcher(c):
@@ -299,11 +305,11 @@ def read_into_while(f, buf, matcher):
 		buf.extend(c)
 
 
-def read_word(f):
+def read_word(f: BinaryIO):
 	return read_while(f, is_letter).decode(ASCII)
 
 
-def read_number(f, default=None):
+def read_number(f, default: Optional[int] = None):
 	c = f.read(1)
 	if is_digit(c) or c == b'-':
 		buf = bytearray(c)
@@ -313,7 +319,7 @@ def read_number(f, default=None):
 	return default
 
 
-def consume_end(f):
+def consume_end(f: BinaryIO):
 	c = f.read(1)
 	if not c.isspace():
 		f.seek(-1, 1)
@@ -321,14 +327,24 @@ def consume_end(f):
 	# skip the LF later while reading normally
 
 
-def skip_chars(f, n):
+def consume(f: BinaryIO, expected: bytes):
+	actual = f.read(len(expected))
+	if actual != expected:
+		raise ValueError(f"expected {expected}, got {actual} at {f.tell()}")
+
+
+def skip_chars(f: BinaryIO, n: int):
 	for _ in range(n):
-		if f.read(1) == b'\\':
+		c = f.read(1)
+		if c == b'\\':
 			if read_word(f):
 				read_number(f)  # unnecessary?
 				consume_end(f)
 			elif f.read(1) == b"'":
 				f.read(2)
+		elif c == b'{ or' or c == b'}':
+			f.seek(-1, 1)
+			return
 
 
 class Parser:
@@ -385,7 +401,7 @@ class Parser:
 				self.dest.write(c.decode(ASCII))
 			elif special := SPECIAL.get(c):
 				self.dest.write(special)
-			elif c == b'\r' or c == b'\n':
+			elif is_endline(c):
 				self.dest.par()
 			elif c == b'*':
 				self.try_read_dest(f)
@@ -395,27 +411,23 @@ class Parser:
 	def read_unicode(self, f: BinaryIO, param: int):
 		# rtf params are supposed to be signed 16-bit, so convert to their unsigned value.
 		# we'll accept any positive number, though.
-		unsigned = param if param >= 0 else param % 0x10000
-		if 0xD800 < unsigned < 0xDBFF:  # high surrogate
+		unsigned = param if param >= 0 else param + 0x10000
+		if 0xD800 < unsigned < 0xDBFF:
 			self.skip_replacement(f)
-			self.consume(f, b"\\u")
+			# in the case of a high surrogate, assume another \u follows
+			consume(f, b"\\u")
 			# ensure low surrogate?
-			next_code = read_number(f)
+			low = read_number(f)
 			consume_end(f)
-			self.dest.write(struct.pack('hh', param, next_code).decode('utf-16-le'))
+			self.dest.write(struct.pack('hh', param, low).decode('utf-16le'))
 		else:
 			self.dest.write(chr(unsigned))
 
-		# we can always handle unicode
+		# always skip replacement chars
 		self.skip_replacement(f)
 
 	def skip_replacement(self, f: BinaryIO):
 		skip_chars(f, self.prop.get('uc', 1))
-
-	def consume(self, f: BinaryIO, expected: bytes):
-		actual = f.read(len(expected))
-		if actual != expected:
-			raise ValueError(actual)
 
 	def handle_control(self, word: str, param: Optional[int]):
 		if instr := getattr(self, '_' + word, None):
@@ -464,10 +476,8 @@ class Parser:
 			self.prop.pop(name, None)
 
 	def try_read_dest(self, f: BinaryIO):
-		read_while(f, lambda c: c in b'\r\n')
-		c = f.read(1)
-		if c != b'\\':
-			raise ValueError(f"{c} at {f.tell()}")
+		read_while(f, is_endline)
+		consume(f, b'\\')
 		word = read_word(f)
 		if instr := getattr(self, '_' + word, None):
 			instr()
@@ -491,8 +501,8 @@ class Parser:
 		return self.font_table.fonts[self.prop.get('f', self.deff)]
 
 	# INSTRUCTION TABLE: Methods prefixed with an underscore correspond to RTF control words, which we'll look up at
-	# runtime. This may not be ideal, but it's the simplest way. Alternatively, create a "controlword" decorator which
-	# adds the function to a dict of valid control words.
+	# runtime. This has downsides (theoretical name collision), but it is simple!
+	# Alternatively, create a "controlword" decorator which adds the function to a dict of valid control words.
 
 	def _rtf(self, version=1):
 		self.dest = self.output
@@ -565,9 +575,15 @@ class Parser:
 	def _pntxta(self):
 		self.dest = TextSetter(self.list_type, 'after')
 
+	def _bin(self, n):
+		# TODO: this and other keywords that take 32-bit integers?
+		pass
+
 	def _result(self):
 		# TODO: handle objects?
 		self.dest = NULL_DEVICE
+
+	# TODO: \sect / \sectd
 
 
 class Output(Destination):
