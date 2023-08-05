@@ -100,12 +100,23 @@ class Destination(ABC):
 		pass
 
 
-class NullDevice(Destination):
-	def write(self, text):
-		pass  # do nothing
+class Output(Destination, ABC):
+
+	def plain_text(self, text: str):
+		raise ValueError(f"{type(self)} can't handle plain text: {text}")
+
+	def prop_change(self, name, old, new):
+		# TODO: probably bad
+		pass
 
 
-NULL_DEVICE = NullDevice()
+class PlainText(Destination):
+
+	def __init__(self, delegate):
+		self.delegate = delegate
+
+	def write(self, text: str):
+		self.delegate.plain_text(text)
 
 
 class RootDest(Destination):
@@ -214,6 +225,14 @@ class TimeSetter(SetValue):
 	def get_value(self):
 		return datetime(*(self.doc.prop[k] for k in ('yr', 'mo', 'dy')),
 		                *(self.doc.prop.get(k, 0) for k in ('hr', 'min', 'sec')))
+
+
+class NullDevice(Destination):
+	def write(self, text):
+		pass  # do nothing
+
+
+NULL_DEVICE = NullDevice()
 
 
 @dataclass
@@ -343,17 +362,16 @@ def skip_chars(f: BinaryIO, n: int):
 
 class Parser:
 
-	def __init__(self, output, plain_text=False):
+	def __init__(self, output):
 		self.output = output(self)
+		self.group = Group.root()
+		self.rtf_version = 1
+		self.charset: Optional[str] = None
+		self.deff: Optional[int] = None
 		self.fonts: dict[int, Font] = {}
 		self.colors: list[Color] = []
 		self.info = Info()
-		self.group = Group.root()
 		self.list_type: Optional[ListType] = None
-		self.plain_text = plain_text
-		self.charset = 'ansi'
-		self.deff = None
-		self.rtf_version = None
 
 	def parse(self, file: str | bytes | os.PathLike):
 		with open(file, 'rb') as f:
@@ -407,7 +425,7 @@ class Parser:
 		# rtf params are supposed to be signed 16-bit, so convert to their unsigned value.
 		# but we'll accept larger positive numbers if that's what's on offer
 		unsigned = param if param >= 0 else param + 0x10000
-		if 0xD800 < unsigned < 0xDBFF:
+		if 0xD800 <= unsigned <= 0xDBFF:
 			self.skip_replacement(f)
 			# in the case of a high surrogate, assume another \u follows
 			consume(f, b'\\u')
@@ -544,7 +562,7 @@ class Parser:
 		self.prop['f'] = self.deff
 
 	def _pntext(self):
-		self.dest = self.output if self.plain_text else NULL_DEVICE
+		self.dest = PlainText(self.output)
 
 	def _info(self):
 		pass  # check for info group validity?
@@ -589,7 +607,7 @@ class Parser:
 	# TODO: \sect / \sectd
 
 
-class Output(Destination):
+class Handler(Output):
 
 	def __init__(self, doc):
 		self._doc = doc
@@ -663,7 +681,7 @@ def diff_prop(old, new):
 	return '; '.join(diffs)
 
 
-class Recorder(Output):
+class Recorder(Handler):
 
 	def __init__(self, doc):
 		super().__init__(doc)
@@ -691,7 +709,7 @@ if __name__ == '__main__':
 	import re
 
 	rtf = Parser(Recorder)
-	rtf.parse('test.rtf')
+	rtf.parse('generated.rtf')
 
 	# print([f.name for f in rtf.font_table.fonts.values()])
 	full_text = ''.join(rtf.output.full_text)
