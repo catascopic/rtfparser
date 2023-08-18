@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import struct
+from collections import deque
 
 import rtfcharset
 
@@ -56,7 +57,7 @@ INFO_PROPS = frozenset({'version', 'edmins', 'nofpages', 'nofwords', 'word_count
 TEXT_INFO = frozenset({'title', 'subject', 'author', 'manager', 'company', 'operator',
                        'category', 'keywords', 'comment', 'doccomm', 'hlinkbase'})
 DATE_INFO = frozenset({'creatim', 'revtim', 'printim', 'buptim'})
-LIST_STYLES = frozenset({'pncard', 'pndec', 'pnucltr', 'pnucrm', 'pnlcltr', 'pnlcrm', 'pnord', 'pnordt'})
+NUMBERING_STYLES = frozenset({'pncard', 'pndec', 'pnucltr', 'pnucrm', 'pnlcltr', 'pnlcrm', 'pnord', 'pnordt'})
 
 ESCAPE = {
 	'line':      '\n',
@@ -97,16 +98,6 @@ class Destination(ABC):
 		raise ValueError(f"{type(self)} can't handle page breaks")
 
 	def close(self):
-		pass
-
-
-class Output(Destination, ABC):
-
-	def plain_text(self, text: str):
-		raise ValueError(f"{type(self)} can't handle plain text: {text}")
-
-	def prop_change(self, name, old, new):
-		# TODO: probably bad
 		pass
 
 
@@ -172,15 +163,22 @@ class ColorTable(Destination):
 			self.doc.prop.get('blue', 0)))
 
 
-@dataclass
-class ListType:
-	style: str = None
-	level: int = 0
-	before: str = ''
-	after: str = ''
-	font_index: int = None
-	indent: int = 0
-	start: int = 1
+class StyleTable(Destination):
+	# TODO
+	pass
+
+
+class Numbering(Destination):
+
+	def __init__(self, doc: Parser):
+		self.doc = doc
+		self.style = None
+		self.level = 0
+		self.before = ''
+		self.after = ''
+		self.font_index = None
+		self.indent = 0
+		self.start = 1
 
 	# TODO: move this somewhere else?
 	def font(self, doc: Parser):
@@ -188,6 +186,9 @@ class ListType:
 		if index is None:
 			index = doc.prop.get('f', doc.deff)
 		return doc.fonts[index]
+
+	def close(self):
+		self.doc.output.numbering_on(self)
 
 
 class SetValue(Destination, ABC):
@@ -332,7 +333,7 @@ def read_number(f, default: Optional[int] = None):
 	return default
 
 
-def consume_end(f: BinaryIO):
+def end_control(f: BinaryIO):
 	c = f.read(1)
 	if not c.isspace():
 		f.seek(-1, 1)
@@ -352,7 +353,7 @@ def skip_chars(f: BinaryIO, n: int):
 		if c == b'\\':
 			if read_word(f):
 				read_number(f)  # unnecessary?
-				consume_end(f)
+				end_control(f)
 			elif f.read(1) == b"'":
 				f.read(2)
 		elif c == b'{' or c == b'}':
@@ -371,10 +372,11 @@ class Parser:
 		self.fonts: dict[int, Font] = {}
 		self.colors: list[Color] = []
 		self.info = Info()
-		self.list_type: Optional[ListType] = None
+		self.numbering: Optional[Numbering] = None
 
 	def parse(self, file: str | bytes | os.PathLike):
 		with open(file, 'rb') as f:
+			# TODO: try/except with f.tell()?
 			while True:
 				text = read_while(f, not_control).translate(None, b'\r\n').decode(ASCII)
 				if text:
@@ -387,18 +389,18 @@ class Parser:
 				elif c == b'}':
 					self.group = self.group.close()
 				else:
+					self.output.end_doc()
 					# must be EOF
-					break
 
 	def read_control(self, f: BinaryIO):
 		word = read_word(f)
 		if word:
 			if esc := ESCAPE.get(word):
-				consume_end(f)
+				end_control(f)
 				self.dest.write(esc)
 			else:
 				param = read_number(f)
-				consume_end(f)
+				end_control(f)
 				# \u is sort of a control word but we handle it separately because it advances the reader
 				if word == 'u':
 					self.read_unicode(f, param)
@@ -425,13 +427,13 @@ class Parser:
 		# rtf params are supposed to be signed 16-bit, so convert to their unsigned value.
 		# but we'll accept larger positive numbers if that's what's on offer
 		unsigned = param if param >= 0 else param + 0x10000
-		if 0xD800 <= unsigned <= 0xDBFF:
+		if 0xD800 <= unsigned < 0xDC00:
 			self.skip_replacement(f)
 			# in the case of a high surrogate, assume another \u follows
 			consume(f, b'\\u')
 			# ensure low surrogate?
 			low = read_number(f)
-			consume_end(f)
+			end_control(f)
 			self.dest.write(struct.pack('hh', param, low).decode('utf-16le'))
 		else:
 			self.dest.write(chr(unsigned))
@@ -459,8 +461,8 @@ class Parser:
 			self.prop['q'] = word[1:]
 		elif word.startswith('ul'):
 			self.prop['ul'] = word[2:] or True
-		elif word in LIST_STYLES:
-			self.list_type.style = word
+		elif word in NUMBERING_STYLES:
+			self.numbering.style = word
 		elif word.startswith('pn'):
 			pass  # TODO: set list properties
 		elif word in UNSUPPORTED_DEST:
@@ -479,7 +481,7 @@ class Parser:
 		# else: pass  # ignore
 
 	def toggle(self, word: str, param: Optional[int]):
-		if not param:
+		if not param:  # 0 or None
 			self.prop.pop(word, None)
 		else:
 			self.prop[word] = True
@@ -521,7 +523,7 @@ class Parser:
 		self.dest = self.output
 		self.rtf_version = version
 
-	def _ansicpg(self, page):
+	def _ansicpg(self, page: int):
 		self.charset = f"cp{page}"
 
 	def _deff(self, n):
@@ -554,7 +556,9 @@ class Parser:
 
 	def _pard(self):
 		self.reset(PARFMT)
-		self.list_type = None
+		if self.numbering is not None:
+			self.output.numbering_off(self.numbering)
+			self.numbering = None
 
 	def _plain(self):
 		self.reset(CHRFMT)
@@ -570,19 +574,19 @@ class Parser:
 	# LISTS
 
 	def _pn(self):
-		self.list_type = ListType()
+		self.numbering = self.dest = Numbering(self)
 
-	def _pnf(self, n):
-		self.list_type.font_index = n
+	def _pnf(self, n: int):
+		self.numbering.font_index = n
 
-	def _pnstart(self, n):
-		self.list_type.start = n
+	def _pnstart(self, n: int):
+		self.numbering.start = n
 
-	def _pnindent(self, n):
-		self.list_type.indent = n
+	def _pnindent(self, n: int):
+		self.numbering.indent = n
 
-	def _pnlvl(self, n):
-		self.list_type.level = n
+	def _pnlvl(self, n: int):
+		self.numbering.level = n
 
 	def _pnlvlbody(self):
 		self._pnlvl(10)
@@ -591,12 +595,12 @@ class Parser:
 		self._pnlvl(11)
 
 	def _pntxtb(self):
-		self.dest = TextSetter(self.list_type, 'before')
+		self.dest = TextSetter(self.numbering, 'before')
 
 	def _pntxta(self):
-		self.dest = TextSetter(self.list_type, 'after')
+		self.dest = TextSetter(self.numbering, 'after')
 
-	def _bin(self, n):
+	def _bin(self, n: int):
 		# TODO: this and other keywords that take 32-bit integers?
 		pass
 
@@ -605,6 +609,21 @@ class Parser:
 		self.dest = NULL_DEVICE
 
 	# TODO: \sect / \sectd
+
+
+class Output(Destination, ABC):
+
+	def plain_text(self, text: str):
+		pass
+
+	def numbering_on(self, info: Numbering):
+		pass
+
+	def numbering_off(self, info: Numbering):
+		pass
+
+	def end_doc(self):
+		pass
 
 
 class Handler(Output):
@@ -658,75 +677,74 @@ class Handler(Output):
 
 	@property
 	def font_size(self):
-		return self.prop['fs']
+		return self.prop.get('fs')
 
 	@property
-	def list_type(self):
-		return self._doc.list_type
+	def numbering(self):
+		return self._doc.numbering
 
 	# TODO: line spacing?
 
 
-def diff_prop(old, new):
-	diffs = []
-	for k in old.keys() & new.keys():
-		oldval = old[k]
-		newval = new[k]
-		if oldval != newval:
-			diffs.append(f"{k}: {oldval}->{newval}")
-	for k in old.keys() - new.keys():
-		diffs.append(f"{k}: -{old[k]}")
-	for k in new.keys() - old.keys():
-		diffs.append(f"{k}: +{new[k]}")
-	return '; '.join(diffs)
-
-
-class Recorder(Handler):
-
-	def __init__(self, doc):
-		super().__init__(doc)
-		self.full_text = []
-		self.last_prop = {}
-		self.styles = set()
-
-	def write(self, text):
-		if self.prop != self.last_prop:
-			# print(diff_prop(self.last_prop, self.prop))
-			self.last_prop = self.prop.copy()
-			self.styles.add(frozenset((k, v) for k, v in self.prop.items() if k in PARFMT or k in CHRFMT))
-		# print(text, end='')
-		# print(text)
-		self.full_text.append(text)
-
-	def par(self):
-		self.full_text.append('\n')
-
-	def page_break(self):
-		pass
-
-
 if __name__ == '__main__':
-	import re
+
+	# card, ord, and ordt not supported
+	HTML_LIST_TYPES = {'pndec': '1',  'pnucltr': 'A', 'pnucrm': 'I', 'pnlcltr': 'a', 'pnlcrm': 'i', }
+
+	def diff_prop(old, new):
+		diffs = []
+		for k in old.keys() & new.keys():
+			oldval = old[k]
+			newval = new[k]
+			if oldval != newval:
+				diffs.append(f"{k}: {oldval}->{newval}")
+		for k in old.keys() - new.keys():
+			if k in TOGGLE:
+				diffs.append(f"+{k}")
+			else:
+				diffs.append(f"{k}: -{old[k]}")
+		for k in new.keys() - old.keys():
+			if k in TOGGLE:
+				diffs.append(f"-{k}")
+			else:
+				diffs.append(f"{k}: +{new[k]}")
+		return '; '.join(diffs)
+
+	class Recorder(Handler):
+
+		def __init__(self, doc):
+			super().__init__(doc)
+			self.paragraphs = []
+			self.current = []
+			self.last_prop = {}
+			self.styles = set()
+			self.par_num = 1
+			self.stack = deque()
+
+		def write(self, text):
+			self.current.append(text)
+			# TODO: the dilemma: handle prop changes as events, or continue doing prop diffs
+			print(diff_prop(self.prop, self.last_prop), text)
+			self.last_prop = self.prop.copy()
+
+		def par(self):
+			line = ''.join(self.current)
+			if self._doc.numbering:
+				print(f"<li>{line}</li>")
+			else:
+				print(f"<p>{line}</p>")
+			self.paragraphs.append(line)
+			self.current = []
+			self.par_num += 1
+
+		def numbering_on(self, info: Numbering):
+			print(f'<ol type="{HTML_LIST_TYPES[info.style]}">')
+
+		def numbering_off(self, info):
+			print('</ol>')
+
+		def end_doc(self):
+			pass
 
 	rtf = Parser(Recorder)
-	rtf.parse('generated.rtf')
-
-	# print([f.name for f in rtf.font_table.fonts.values()])
-	full_text = ''.join(rtf.output.full_text)
-	print(full_text)
-	# (?:[^\W_]|['‘’\-])
-	WORDS = re.compile(r"[^\W_][\w'‘’\-]*")
-	words = WORDS.findall(full_text)
-	print(f'words: {len(words)}, chars: {len(full_text)}')
-
-	it = iter(rtf.output.styles)
-	common = set(next(it))
-	for s in it:
-		common = common.intersection(s)
-
-	print('COMMON:', common)
-
-	styles = [dict(s) for s in rtf.output.styles]
-
-	for s in rtf.output.styles:
-		print(dict(s - common))
+	rtf.parse('style.rtf')
