@@ -6,7 +6,7 @@ from collections import deque
 
 import rtfcharset
 
-from abc import ABC
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, BinaryIO, Iterable, Callable
@@ -44,8 +44,8 @@ PARFMT = frozenset({
 	'rtlpar', 'ltrpar',  # direction
 })
 
-# Character formatting (reset with \plain)
 TOGGLE = frozenset({'b', 'caps', 'deleted', 'i', 'outl', 'scaps', 'shad', 'strike', 'ul', 'v'})  # hyphpar
+# Character formatting (reset with \plain)
 CHRFMT = frozenset({
 	'animtext', 'charscalex', 'dn', 'embo', 'impr', 'sub', 'expnd', 'expndtw',
 	'kerning', 'f', 'fs', 'strikedl', 'up', 'super', 'cf', 'cb', 'rtlch',
@@ -103,7 +103,7 @@ class Destination(ABC):
 
 class PlainText(Destination):
 
-	def __init__(self, delegate):
+	def __init__(self, delegate: Output):
 		self.delegate = delegate
 
 	def write(self, text: str):
@@ -163,15 +163,14 @@ class ColorTable(Destination):
 			self.doc.prop.get('blue', 0)))
 
 
-class StyleTable(Destination):
-	# TODO
-	pass
+# TODO: StyleTable?
 
 
 class Numbering(Destination):
 
 	def __init__(self, doc: Parser):
 		self.doc = doc
+		self.prop = {}
 		self.style = None
 		self.level = 0
 		self.before = ''
@@ -191,12 +190,32 @@ class Numbering(Destination):
 		self.doc.output.numbering_on(self)
 
 
+class Field(Destination):
+	def close(self):
+		pass
+
+
+class FieldInstruction(Destination):
+
+	def __init__(self):
+		self.content = []
+
+	def write(self, text):
+		self.content.append(text)
+
+	def close(self):
+		text = ''.join(self.content).strip()
+		
+
+
+
 class SetValue(Destination, ABC):
 
 	def __init__(self, obj, prop):
 		self.obj = obj
 		self.prop = prop
 
+	@abstractmethod
 	def get_value(self):
 		raise NotImplementedError
 
@@ -267,7 +286,7 @@ class Group:
 		return cls(None, RootDest(), {})
 
 	def open(self):
-		# could use ChainMap here, but we'd have to replace pop() with setting to None.
+		# could use ChainMap here, but we'd have to replace pop() with setting to None/0.
 		# this would be a big pain when resetting properties.
 		return Group(self, None, self.prop.copy())
 
@@ -464,7 +483,8 @@ class Parser:
 		elif word in NUMBERING_STYLES:
 			self.numbering.style = word
 		elif word.startswith('pn'):
-			pass  # TODO: set list properties
+			# TODO: toggling?
+			self.numbering.prop[word[2:]] = param
 		elif word in UNSUPPORTED_DEST:
 			self.dest = NULL_DEVICE
 		elif charset := CHARSETS.get(word):
@@ -480,8 +500,10 @@ class Parser:
 			self.prop[word] = param
 		# else: pass  # ignore
 
-	def toggle(self, word: str, param: Optional[int]):
-		if not param:  # 0 or None
+	def toggle(self, word: str, param: int):
+		# TODO: is toggling even a special case? If I just accept falsy values everything should still work.
+		#  Could I use ChainMaps in that case?
+		if param == 0:
 			self.prop.pop(word, None)
 		else:
 			self.prop[word] = True
@@ -607,6 +629,12 @@ class Parser:
 	def _result(self):
 		# TODO: handle objects?
 		self.dest = NULL_DEVICE
+
+	def _field(self):
+		self.dest = Field()
+
+	def _fldinst(self):
+		self.dest = FieldInstruction(doc)
 
 	# TODO: \sect / \sectd
 
