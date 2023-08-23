@@ -287,7 +287,7 @@ class Group:
 
 	def open(self):
 		# could use ChainMap here, but we'd have to replace pop() with setting to None/0.
-		# this would be a big pain when resetting properties.
+		# seems simpler to just copy the map, since it also reduces lookup time
 		return Group(self, None, self.prop.copy())
 
 	@property
