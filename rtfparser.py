@@ -17,8 +17,8 @@ from typing import Optional, BinaryIO, Iterable, Callable
 # the stream. (We also get to use bytebuffer a few times and avoid having to do ''.join on lists of chars.)
 # The one awkward part is, in python, characters are 1-char strings, while individual bytes are just ints.
 # We don't want to use ints, because they make the code hard to read, so we instead use byte sequences of length 1.
-# This isn't ideal, but it's really the only downside to this paradigm (other than having to remember to start all your
-# strings with the b prefix).
+# This isn't ideal, but it's really the only downside to this paradigm (other than having to remember to start your
+# strings with the b prefix in that section of the code).
 
 # TODO: \upr, \ud (these are only used for not-output destinations)
 
@@ -191,22 +191,21 @@ class Numbering(Destination):
 
 
 class Field(Destination):
-	def close(self):
-		pass
 
-
-class FieldInstruction(Destination):
-
-	def __init__(self):
-		self.content = []
-
-	def write(self, text):
-		self.content.append(text)
+	def __init__(self, delegate: Output):
+		self.delegate = delegate
+		self.instruction = ''
+		self.result = ''
+		self.set_instruction = TextSetter(self, 'instruction')
+		self.set_result = TextSetter(self, 'result')
 
 	def close(self):
-		text = ''.join(self.content).strip()
-		
-
+		instr, *params = self.instruction.split()
+		if instr == 'HYPERLINK':
+			url = params[0].removeprefix('"').removesuffix('"')
+			self.delegate.hyperlink(self.result, url)
+		else:
+			raise ValueError(f"unknown instruction: {self.instruction}")
 
 
 class SetValue(Destination, ABC):
@@ -407,9 +406,11 @@ class Parser:
 					self.group = self.group.open()
 				elif c == b'}':
 					self.group = self.group.close()
-				else:
+				elif c == b'':
 					self.output.end_doc()
-					# must be EOF
+					break
+				else:
+					raise ValueError(f"illegal char: {c} at {f.tell()}")
 
 	def read_control(self, f: BinaryIO):
 		word = read_word(f)
@@ -631,10 +632,13 @@ class Parser:
 		self.dest = NULL_DEVICE
 
 	def _field(self):
-		self.dest = Field()
+		self.dest = Field(self.output)
 
 	def _fldinst(self):
-		self.dest = FieldInstruction(doc)
+		self.dest = self.dest.set_instruction
+
+	def _fldrslt(self):
+		self.dest = self.dest.set_result
 
 	# TODO: \sect / \sectd
 
@@ -642,6 +646,9 @@ class Parser:
 class Output(Destination, ABC):
 
 	def plain_text(self, text: str):
+		pass
+
+	def hyperlink(self, text, url):
 		pass
 
 	def numbering_on(self, info: Numbering):
@@ -771,8 +778,11 @@ if __name__ == '__main__':
 		def numbering_off(self, info):
 			print('</ol>')
 
+		def hyperlink(self, text, url):
+			print(f'<a href="{url}">{text}</a>')
+
 		def end_doc(self):
 			pass
 
 	rtf = Parser(Recorder)
-	rtf.parse('style.rtf')
+	rtf.parse('testdocs/generated.rtf')
