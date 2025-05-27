@@ -9,7 +9,7 @@ import rtfcharset
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, BinaryIO, Iterable, Callable
+from typing import Type, Optional, IO, BinaryIO, Iterable, Callable
 
 # This parser makes a questionable, but I believe justified, decision to parse files in binary mode.
 # RTF files are pure ascii, so it sort of doesn't matter. Strings are generally easier to work with in python,
@@ -72,9 +72,9 @@ ESCAPE = {
 }
 
 SPECIAL = {
-	b'~': '\u00A0',  # nonbreaking space
-	b'-': '\u00AD',  # optional hyphen
-	b'_': '\u2011',  # nonbreaking hyphen
+	b'~': '\N{NO-BREAK SPACE}',
+	b'-': '\N{SOFT HYPHEN}',
+	b'_': '\N{NON-BREAKING HYPHEN}',
 }
 
 # can't do frozenset(b'\\{}') because iterating bytes gives you ints
@@ -113,8 +113,8 @@ class PlainText(Destination):
 class RootDest(Destination):
 	# TODO: in theory this should only allow one write
 	def write(self, text):
-		if text != '\u0000':
-			raise ValueError(f"expected NUL but got {text}")
+		if text != '\N{NULL}':
+			raise ValueError(f"expected NULL but got {text}")
 
 
 @dataclass(frozen=True)
@@ -288,6 +288,11 @@ class Group:
 		# could use ChainMap here, but we'd have to replace pop() with setting to None/0.
 		# seems simpler to just copy the map, since it also reduces lookup time
 		return Group(self, None, self.prop.copy())
+	
+	def close(self):
+		if self.own_dest is not None:
+			self.own_dest.close()
+		return self.parent
 
 	@property
 	def dest(self):
@@ -296,11 +301,6 @@ class Group:
 	@dest.setter
 	def dest(self, value):
 		self.own_dest = value
-
-	def close(self):
-		if self.own_dest is not None:
-			self.own_dest.close()
-		return self.parent
 
 
 def not_control(c: bytes) -> bool:
@@ -381,7 +381,7 @@ def skip_chars(f: BinaryIO, n: int):
 
 class Parser:
 
-	def __init__(self, output):
+	def __init__(self, output: Type[Recorder]):
 		self.output = output(self)
 		self.group = Group.root()
 		self.rtf_version = 1
@@ -743,46 +743,90 @@ if __name__ == '__main__':
 				diffs.append(f"-{k}")
 			else:
 				diffs.append(f"{k}: +{new[k]}")
-		return '; '.join(diffs)
+		if not diffs:
+			return ''
+		return f"<{'; '.join(diffs)}>"
 
-	class Recorder(Handler):
 
-		def __init__(self, doc):
-			super().__init__(doc)
-			self.paragraphs = []
-			self.current = []
-			self.last_prop = {}
-			self.styles = set()
-			self.par_num = 1
-			self.stack = deque()
+	HTML_TRANS = str.maketrans({'&': '&amp;', '<': '&lt;', '>': '&gt;', '\n': '\n<br>'})
 
-		def write(self, text):
-			self.current.append(text)
-			# TODO: the dilemma: handle prop changes as events, or continue doing prop diffs
-			print(diff_prop(self.prop, self.last_prop), text)
-			self.last_prop = self.prop.copy()
+	with open('result.html', 'w', encoding='utf-8') as writer:
 
-		def par(self):
-			line = ''.join(self.current)
-			if self._doc.numbering:
-				print(f"<li>{line}</li>")
-			else:
-				print(f"<p>{line}</p>")
-			self.paragraphs.append(line)
-			self.current = []
-			self.par_num += 1
+		class Recorder(Handler):
 
-		def numbering_on(self, info: Numbering):
-			print(f'<ol type="{HTML_LIST_TYPES[info.style]}">')
+			def __init__(self, doc):
+				super().__init__(doc)
+				self.paragraphs = []
+				self.current = []
+				self.last_prop = {}
+				self.styles = set()
+				self.par_num = 1
+				self.stack = deque()
+				self.blockquote = False
 
-		def numbering_off(self, info):
-			print('</ol>')
+			def write(self, text):
+				# TODO: the dilemma: handle prop changes as events, or continue doing prop diffs
+				# print(diff_prop(self.prop, self.last_prop), end='')
+				prop_on = (self.prop.keys() - self.last_prop.keys()) & TOGGLE
+				prop_off = (self.last_prop.keys() - self.prop.keys()) & TOGGLE
+				if 'i' in prop_on:
+					self.current.append('<i>')
+					self.stack.append('i')
+				if 'i' in prop_off:
+					if self.stack.pop() != 'i':
+						raise ValueError
+					if self.current[-1] == '<i>':
+						self.current.pop()
+					else:
+						self.current.append('</i>')
 
-		def hyperlink(self, text, url):
-			print(f'<a href="{url}">{text}</a>')
+				self.last_prop = self.prop.copy()
+				self.current.append(text.translate(HTML_TRANS))
 
-		def end_doc(self):
-			pass
+			def par(self):
+				for i in self.stack:
+					if self.current[-1] == f"<{i}>":
+						self.current.pop()
+					else:
+						self.current.append(f"</{i}>")
 
-	rtf = Parser(Recorder)
-	rtf.parse('testdocs/generated.rtf')
+				line = ''.join(self.current)
+				if self._doc.numbering:
+					tag = 'li'
+				else:
+					tag = 'p'
+
+				css = []
+				if self.prop.get('q') == 'c':
+					css.append('text-align: center;')
+				style = f" style=\"{' '.join(css)}\"" if css else ''
+
+				endtag = f"</{tag}>" if tag != 'p' else ''
+
+				if self.prop.get('li', 0) > 0 and not self.blockquote:
+					self.blockquote = True
+					writer.write('\n<blockquote>')
+				elif self.prop.get('li', 0) == 0 and self.blockquote:
+					self.blockquote = False
+					writer.write('\n</blockquote>')
+				writer.write(f"\n<{tag}{style}>{line}{endtag}")
+
+				self.paragraphs.append(line)
+				self.current = [f"<{i}>" for i in self.stack]
+				self.par_num += 1
+
+			def numbering_on(self, info: Numbering):
+				writer.write(f'<ol type="{HTML_LIST_TYPES[info.style]}">')
+
+			def numbering_off(self, info):
+				writer.write('</ol>')
+
+			def hyperlink(self, text, url):
+				# TODO: condense hyperlinks?
+				self.current.append(f'<a href="{url}">{text}</a>')
+
+			def end_doc(self):
+				pass
+
+		rtf = Parser(Recorder)
+		rtf.parse('infohazards.rtf')
