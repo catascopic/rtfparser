@@ -1,12 +1,11 @@
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass(frozen=True)
 class Language:
 	description: str
-	tag: Optional[str]
-	locale: str = None
+	tag: str | None
+	locale: str | None = None
 
 
 NO_LANGUAGE = Language('No language', None)
