@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Callable, Iterator, NamedTuple, Optional
+from typing import Callable, Iterator, NamedTuple
 
 SWITCH = '\\'
 QUOTE = '"'
@@ -73,7 +73,7 @@ class InstructionParser:
 
 	def add_argument(self, 
 		name: str, 
-		dest: Optional[str] = None, 
+		dest: str | None = None, 
 		flag: bool = False,
 		type: Callable[[str], object] = str, 
 		default: object = None

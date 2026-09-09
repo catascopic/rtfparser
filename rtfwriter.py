@@ -1,7 +1,7 @@
 import struct
 
 from rtfparser import Font, Color
-from typing import Optional, Iterable, TextIO
+from typing import Iterable, TextIO
 
 
 ESCAPE = {
@@ -54,7 +54,7 @@ class RtfWriter:
 		self.handle.write('\\*')
 		self.control(dest)
 
-	def control(self, word, param: Optional[int] = None):
+	def control(self, word, param: int | None = None):
 		self.handle.write('\\')
 		self.handle.write(word)
 		if param is not None:

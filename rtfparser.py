@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Type, Optional, IO, BinaryIO, Iterable, Callable
+from typing import Type, BinaryIO, Iterable, Callable
 
 # This parser makes a questionable, but I believe justified, decision to parse files in binary mode.
 # RTF files are pure ascii, so it sort of doesn't matter. Strings are generally easier to work with in python,
@@ -141,7 +141,7 @@ class RootDest(Destination):
 class Font:
 	name: str
 	family: str
-	charset: Optional[str] = None
+	charset: str | None = None
 
 
 class FontTable(Destination):
@@ -358,8 +358,8 @@ class Info:
 
 @dataclass
 class Group:
-	parent: Optional[Group]
-	own_dest: Optional[Destination]
+	parent: Group | None
+	own_dest: Destination | None
 	# TODO: do we want to include string values here?
 	prop: dict[str, str | int | bool]
 
@@ -424,7 +424,7 @@ def read_word(f: BinaryIO):
 	return read_while(f, is_letter).decode(ASCII)
 
 
-def read_number(f, default: Optional[int] = None):
+def read_number(f, default: int | None = None):
 	c = f.read(1)
 	if is_digit(c) or c == b'-':
 		buf = bytearray(c)
@@ -468,12 +468,12 @@ class Parser:
 		self.output = output(self)
 		self.group = Group.root()
 		self.rtf_version = 1
-		self.charset: Optional[str] = None
-		self.deff: Optional[int] = None
+		self.charset: str | None = None
+		self.deff: int | None = None
 		self.fonts: dict[int, Font] = {}
 		self.colors: list[Color] = []
 		self.info = Info()
-		self.numbering: Optional[Numbering] = None
+		self.numbering: Numbering | None = None
 
 	def parse(self, file: str | bytes | os.PathLike):
 		with open(file, 'rb') as f:
@@ -545,14 +545,14 @@ class Parser:
 		# always skip replacement chars
 		self.skip_replacement(f)
 
-	def _read_bin(self, f: BinaryIO, n: Optional[int]):
+	def _read_bin(self, f: BinaryIO, n: int | None):
 		# the next n bytes are raw data rather than rtf. \bin with no param means no data at all
 		self.dest.write_bin(f.read(n or 0))
 
 	def skip_replacement(self, f: BinaryIO):
 		skip_chars(f, self.prop.get('uc', 1))
 
-	def handle_control(self, word: str, param: Optional[int]):
+	def handle_control(self, word: str, param: int | None):
 		if instr := getattr(self, '_' + word, None):
 			if param is None:
 				instr()
