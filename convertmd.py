@@ -32,7 +32,9 @@ import re
 import sys
 from pathlib import Path
 
-from rtfparser import Parser, Handler, Numbering
+import rtfparser
+
+from rtfparser import Handler, Numbering
 
 # Characters that have special meaning in Markdown and need escaping when they
 # appear in plain document text (so they don't get misinterpreted downstream).
@@ -154,9 +156,7 @@ class MarkdownOutput(Handler):
 
 
 def convert(rtf_path: str | Path) -> str:
-	parser = Parser(MarkdownOutput)
-	parser.parse(rtf_path)
-	return parser.output.markdown
+	return rtfparser.parse(rtf_path, MarkdownOutput).markdown
 
 
 def main():

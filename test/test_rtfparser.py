@@ -7,15 +7,16 @@ stream, so each test writes its source to a temp file first -- letting Parser.pa
 open binary stream would make this a lot less ceremonious.
 """
 
+import io
 import os
 import sys
-import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import rtfcharset
+import rtfparser
 
 from rtfparser import Destination, Handler, NullDevice, NULL_DEVICE, Parser, RtfWarning
 
@@ -33,6 +34,7 @@ class Recorder(Handler):
 		self.pictures = []
 		self.lists = []
 		self.warnings = []
+		self.positions = []
 
 	def write(self, text):
 		self.text.append(text)
@@ -54,18 +56,11 @@ class Recorder(Handler):
 
 	def warning(self, message, position=None):
 		self.warnings.append(message)
+		self.positions.append(position)
 
 
 def parse(source: bytes, strict: bool = False) -> Recorder:
-	fd, path = tempfile.mkstemp(suffix='.rtf')
-	try:
-		with os.fdopen(fd, 'wb') as f:
-			f.write(source)
-		doc = Parser(Recorder, strict=strict)
-		doc.parse(path)
-		return doc.output
-	finally:
-		os.remove(path)
+	return rtfparser.parse_bytes(source, Recorder, strict=strict)
 
 
 def text_of(source: bytes) -> str:
@@ -269,13 +264,7 @@ class TestWarnings(unittest.TestCase):
 			def warning(self, message, position=None):
 				positions.append(position)
 
-		fd, path = tempfile.mkstemp(suffix='.rtf')
-		try:
-			with os.fdopen(fd, 'wb') as f:
-				f.write(HEADER + rb"\pnstart5 x}")
-			Parser(Positional).parse(path)
-		finally:
-			os.remove(path)
+		rtfparser.parse_bytes(HEADER + rb"\pnstart5 x}", Positional)
 		self.assertEqual(len(positions), 1)
 		self.assertIsInstance(positions[0], int)
 		self.assertGreater(positions[0], 0)
@@ -295,13 +284,89 @@ class TestWarnings(unittest.TestCase):
 			def par(self):
 				pass
 
-		fd, path = tempfile.mkstemp(suffix='.rtf')
-		try:
-			with os.fdopen(fd, 'wb') as f:
-				f.write(HEADER + rb"\pnstart5 x}")
-			Parser(Quiet).parse(path)
-		finally:
-			os.remove(path)
+		rtfparser.parse_bytes(HEADER + rb"\pnstart5 x}", Quiet)
+
+
+class TestEntryPoints(unittest.TestCase):
+
+	SOURCE = HEADER + rb"{\info{\title Hi}{\author Max}}\f0 hello}"
+
+	def test_parse_bytes_returns_the_output(self):
+		out = rtfparser.parse_bytes(self.SOURCE, Recorder)
+		self.assertIsInstance(out, Recorder)
+		self.assertEqual(''.join(out.text), 'hello')
+
+	def test_parse_stream_returns_the_output(self):
+		out = rtfparser.parse_stream(io.BytesIO(self.SOURCE), Recorder)
+		self.assertEqual(''.join(out.text), 'hello')
+
+	def test_document_info_is_reachable_without_the_parser(self):
+		# the \info block lives on the Parser, so Handler has to surface it or hiding
+		# the parser would hide document metadata entirely
+		info = rtfparser.parse_bytes(self.SOURCE, Recorder).info
+		self.assertEqual(info.title, 'Hi')
+		self.assertEqual(info.author, 'Max')
+
+	def test_strict_is_passed_through(self):
+		with self.assertRaises(RtfWarning):
+			rtfparser.parse_bytes(HEADER + rb"\pnstart5 x}", Recorder, strict=True)
+
+	def test_all_three_entry_points_agree(self):
+		path = os.path.join(ROOT, 'testdocs', 'hyper.rtf')
+		with open(path, 'rb') as f:
+			data = f.read()
+		results = [
+			rtfparser.parse(path, Recorder),
+			rtfparser.parse_bytes(data, Recorder),
+			rtfparser.parse_stream(io.BytesIO(data), Recorder),
+		]
+		self.assertEqual(len({''.join(r.text) for r in results}), 1)
+		self.assertEqual(len({tuple(r.links) for r in results}), 1)
+
+	def test_warning_positions_survive_every_entry_point(self):
+		# read_all used to be the stream door while parse() kept the bookkeeping,
+		# so anything entering that way lost its offsets
+		source = HEADER + rb"\pnstart5 x}"
+		by_bytes = rtfparser.parse_bytes(source, Recorder)
+		by_stream = rtfparser.parse_stream(io.BytesIO(source), Recorder)
+		self.assertEqual(len(by_bytes.positions), 1)
+		self.assertEqual(by_bytes.positions, by_stream.positions)
+		self.assertIsInstance(by_bytes.positions[0], int)
+
+
+class TestStreamGuards(unittest.TestCase):
+
+	def test_rejects_a_non_seekable_stream(self):
+		class Pipe(io.RawIOBase):
+			def __init__(self, data):
+				self.data = io.BytesIO(data)
+
+			def read(self, n=-1):
+				return self.data.read(n)
+
+			def readable(self):
+				return True
+
+			def seekable(self):
+				return False
+
+		with self.assertRaises(ValueError) as caught:
+			rtfparser.parse_stream(io.BufferedReader(Pipe(b'{\\rtf1}')), Recorder)
+		self.assertIn('seekable', str(caught.exception))
+
+	def test_rejects_a_text_mode_handle(self):
+		path = os.path.join(ROOT, 'testdocs', 'hyper.rtf')
+		with open(path) as f:              # no 'b'
+			with self.assertRaises(ValueError) as caught:
+				rtfparser.parse_stream(f, Recorder)
+		self.assertIn('binary', str(caught.exception))
+
+	def test_rejects_a_parser_already_in_use(self):
+		doc = Parser(Recorder)
+		doc.file = io.BytesIO(b'')         # pretend a parse is under way
+		with self.assertRaises(ValueError) as caught:
+			doc.parse_bytes(b'{\\rtf1}')
+		self.assertIn('already', str(caught.exception))
 
 
 class TestSampleDocuments(unittest.TestCase):
@@ -317,12 +382,11 @@ class TestSampleDocuments(unittest.TestCase):
 	def test_all_parse(self):
 		for path in self.documents():
 			with self.subTest(document=os.path.basename(path)):
-				Parser(Recorder).parse(path)
+				rtfparser.parse(path, Recorder)
 
 	def test_hyperlinks_are_extracted(self):
-		doc = Parser(Recorder)
-		doc.parse(os.path.join(ROOT, 'testdocs', 'hyper.rtf'))
-		self.assertEqual(doc.output.links, [('Flaming Text', 'http://flamingtext.com')])
+		out = rtfparser.parse(os.path.join(ROOT, 'testdocs', 'hyper.rtf'), Recorder)
+		self.assertEqual(out.links, [('Flaming Text', 'http://flamingtext.com')])
 
 
 if __name__ == '__main__':

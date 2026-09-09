@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import struct
 
@@ -11,7 +12,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
-from typing import BinaryIO
+from typing import BinaryIO, TypeVar
 
 # This parser makes a questionable, but I believe justified, decision to parse files in binary mode.
 # RTF files are pure ascii, so it sort of doesn't matter. Strings are generally easier to work with in python,
@@ -532,12 +533,23 @@ class Parser:
 
 	def parse(self, file: str | bytes | os.PathLike):
 		with open(file, 'rb') as f:
-			# kept on the parser so warnings raised deep in a destination can still say where we are
-			self.file = f
-			try:
-				self.read_all(f)
-			finally:
-				self.file = None
+			self.parse_stream(f)
+
+	def parse_bytes(self, data: bytes):
+		self.parse_stream(io.BytesIO(data))
+
+	def parse_stream(self, f: BinaryIO):
+		if self.file is not None:
+			raise ValueError("this parser is already reading a document")
+		if not f.seekable():
+			raise ValueError(f"{f} is not seekable")
+		if isinstance(f.read(0), str):
+			raise ValueError(f"{f} is not open in binary mode")
+		self.file = f
+		try:
+			self.read_all(f)
+		finally:
+			self.file = None
 
 	def read_all(self, f: BinaryIO):
 		while True:
@@ -898,6 +910,11 @@ class Handler(Output):
 		return self._doc.prop
 
 	@property
+	def info(self):
+		# the \info block: title, author, company, creatim and friends
+		return self._doc.info
+
+	@property
 	def fonts(self):
 		return self._doc.fonts
 
@@ -944,3 +961,29 @@ class Handler(Output):
 	@property
 	def numbering(self):
 		return self._doc.numbering
+
+
+# The way in. A Parser reads exactly one document and its Output accumulates the results, so these
+# hand back the Output rather than the Parser -- there's nothing useful to do with a spent one, and
+# reusing it would silently merge two documents. Parser stays public for anyone who wants the parse
+# state itself, but nobody has to know it exists to read a file.
+
+OutputType = TypeVar('OutputType', bound=Output)
+
+
+def parse(file: str | bytes | os.PathLike, output: type[OutputType], *, strict: bool = False) -> OutputType:
+	doc = Parser(output, strict)
+	doc.parse(file)
+	return doc.output
+
+
+def parse_bytes(data: bytes, output: type[OutputType], *, strict: bool = False) -> OutputType:
+	doc = Parser(output, strict)
+	doc.parse_bytes(data)
+	return doc.output
+
+
+def parse_stream(f: BinaryIO, output: type[OutputType], *, strict: bool = False) -> OutputType:
+	doc = Parser(output, strict)
+	doc.parse_stream(f)
+	return doc.output
