@@ -6,9 +6,10 @@ from __future__ import annotations
 # Note that these tokens have already been through the rtf lexer, so a `\\` in the file arrives as a single
 # backslash. Word still doubles the backslashes of paths inside quoted arguments, so we undo that in the tokenizer.
 
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Callable, Iterator, NamedTuple
+from typing import NamedTuple
 
 SWITCH = '\\'
 QUOTE = '"'

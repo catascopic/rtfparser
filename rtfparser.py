@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import os
 import struct
-from collections import deque
 
 import rtfcharset
 import rtffields
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Type, BinaryIO, Iterable, Callable
+from typing import BinaryIO
 
 # This parser makes a questionable, but I believe justified, decision to parse files in binary mode.
 # RTF files are pure ascii, so it sort of doesn't matter. Strings are generally easier to work with in python,
@@ -339,21 +339,21 @@ NULL_DEVICE = NullDevice()
 
 @dataclass
 class Info:
-	title: str = None
-	subject: str = None
-	author: str = None
-	manager: str = None
-	company: str = None
-	operator: str = None
-	category: str = None
-	keywords: str = None
-	comment: str = None
-	doccomm: str = None
-	hlinkbase: str = None
-	creatim: datetime = None
-	revtim: datetime = None
-	printim: datetime = None
-	buptim: datetime = None
+	title: str | None = None
+	subject: str | None = None
+	author: str | None = None
+	manager: str | None = None
+	company: str | None = None
+	operator: str | None = None
+	category: str | None = None
+	keywords: str | None = None
+	comment: str | None = None
+	doccomm: str | None = None
+	hlinkbase: str | None = None
+	creatim: datetime | None = None
+	revtim: datetime | None = None
+	printim: datetime | None = None
+	buptim: datetime | None = None
 
 
 @dataclass
@@ -464,7 +464,7 @@ def skip_chars(f: BinaryIO, n: int):
 
 class Parser:
 
-	def __init__(self, output: Type[Output]):
+	def __init__(self, output: type[Output]):
 		self.output = output(self)
 		self.group = Group.root()
 		self.rtf_version = 1

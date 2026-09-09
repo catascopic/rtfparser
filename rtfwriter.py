@@ -1,7 +1,9 @@
 import struct
 
+from collections.abc import Iterable
+from typing import TextIO
+
 from rtfparser import Font, Color
-from typing import Iterable, TextIO
 
 
 ESCAPE = {
