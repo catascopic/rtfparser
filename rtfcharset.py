@@ -23,7 +23,12 @@ CHARSETS = {
 }
 
 
-def get_encoding(charset: int | None, default: str) -> str:
-	if charset is None or charset == 1:
-		return default
-	return CHARSETS[charset]
+# the last resort when a document declares no charset and its font doesn't name one either
+DEFAULT_ENCODING = 'cp1252'
+
+
+def get_encoding(charset: int | None, default: str | None) -> str:
+	# \fcharset1 defers to the document by definition, and an unlisted value is far more likely to be
+	# a codepage we haven't covered than a broken file, so both fall back instead of failing. The
+	# document's own charset is optional too, which is what DEFAULT_ENCODING is for.
+	return CHARSETS.get(charset) or default or DEFAULT_ENCODING

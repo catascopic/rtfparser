@@ -150,6 +150,11 @@ class Font:
 	charset: str | None = None
 
 
+# stands in for a font a document references but never defined. Its charset is None, which means
+# \'hh bytes in it decode with the document's charset -- the same thing \fcharset1 asks for.
+DEFAULT_FONT = Font('', 'nil')
+
+
 class FontTable(Destination):
 
 	def __init__(self, doc: Parser):
@@ -210,7 +215,7 @@ class Numbering(Destination):
 		index = self.font_index
 		if index is None:
 			index = doc.prop.get('f', doc.deff)
-		return doc.fonts[index]
+		return doc.get_font(index)
 
 	def close(self):
 		self.doc.output.numbering_on(self)
@@ -274,10 +279,14 @@ class Field(Destination):
 
 	def close(self):
 		name, *args = self.instruction.text.split(maxsplit=1)
-		parser = rtffields.PARSERS.get(name)
-		if parser is None:
-			raise ValueError(f"unknown instruction: {name}")
-		getattr(self.delegate, name.lower())(self.result.text, parser.parse(args[0]) if args else None)
+		if args:
+			parser = rtffields.PARSERS.get(name)
+			if parser is None:
+				raise ValueError(f"unknown instruction: {name}")
+			result = parser.parse(args)
+		else:
+			result = None
+		getattr(self.delegate, name.lower())(self.result.text, result)
 
 
 class SetValue(Destination, ABC):
@@ -555,13 +564,17 @@ class Parser:
 	def skip_replacement(self, f: BinaryIO):
 		skip_chars(f, self.prop.get('uc', 1))
 
+	def call(self, instr: Callable, param: int | None):
+		# the instruction table is keyed by name alone, so we don't know a word's arity up front
+		# TODO: error message if arity doesn't match
+		if param is None:
+			instr()
+		else:
+			instr(param)
+
 	def handle_control(self, word: str, param: int | None):
 		if instr := getattr(self, '_' + word, None):
-			# TODO: error message if arity doesn't match
-			if param is None:
-				instr()
-			else:
-				instr(param)
+			self.call(instr, param)
 			return
 
 		if param is None:
@@ -577,10 +590,11 @@ class Parser:
 		elif word.startswith('ul'):
 			self.prop['ul'] = word[2:] or True
 		elif word in NUMBERING_STYLES:
-			self.numbering.style = word
+			self.set_numbering('style', word)
 		elif word.startswith('pn'):
 			# TODO: toggling?
-			self.numbering.prop[word[2:]] = param
+			if self.numbering is not None:
+				self.numbering.prop[word[2:]] = param
 		elif word in UNSUPPORTED_DEST:
 			self.dest = NULL_DEVICE
 		elif charset := CHARSETS.get(word):
@@ -612,8 +626,12 @@ class Parser:
 		read_while(f, is_endline)
 		consume(f, b'\\')
 		word = read_word(f)
+		# a \* destination is still a control word: it can take a param (\*\pnseclvl3) and it owns
+		# the delimiter after it, which would otherwise turn up as text in the destination we open
+		param = read_number(f)
+		end_control(f)
 		if instr := getattr(self, '_' + word, None):
-			instr()
+			self.call(instr, param)
 		else:
 			self.dest = NULL_DEVICE
 
@@ -632,9 +650,15 @@ class Parser:
 		if self.dest is not NULL_DEVICE:
 			self.group.dest = value
 
+	def get_font(self, index: int | None) -> Font:
+		# documents reference fonts they never put in the table, and \deff can be missing entirely.
+		# a font only steers decoding and styling, so a stand-in beats aborting the whole parse.
+		font = self.fonts.get(index)
+		return DEFAULT_FONT if font is None else font
+
 	@property
-	def current_font(self):
-		return self.fonts[self.prop.get('f', self.deff)]
+	def current_font(self) -> Font:
+		return self.get_font(self.prop.get('f', self.deff))
 
 	# INSTRUCTION TABLE: Methods prefixed with an underscore correspond to RTF control words, which we'll look up at
 	# runtime. This has downsides (theoretical name collision), but it is simple!
@@ -684,7 +708,10 @@ class Parser:
 	def _plain(self):
 		self.reset(CHRFMT)
 		# use actual font obj?
-		self.prop['f'] = self.deff
+		# reset() already dropped f, and current_font falls back to deff on its own,
+		# so only write it back when there's an actual default font to name
+		if self.deff is not None:
+			self.prop['f'] = self.deff
 
 	def _pntext(self):
 		self.dest = PlainText(self.output)
@@ -697,17 +724,30 @@ class Parser:
 	def _pn(self):
 		self.numbering = self.dest = Numbering(self)
 
+	# \pn* words aren't confined to a {\*\pn} group: \pnseclvl and friends describe section
+	# numbering we don't model, and a malformed file can put any of them anywhere. With no
+	# Numbering to set them on there's nothing meaningful to do, so we drop them.
+
+	def set_numbering(self, attr: str, value):
+		if self.numbering is not None:
+			setattr(self.numbering, attr, value)
+
+	def numbering_text(self, attr: str) -> Destination:
+		if self.numbering is None:
+			return NULL_DEVICE
+		return TextSetter(self.numbering, attr)
+
 	def _pnf(self, n: int):
-		self.numbering.font_index = n
+		self.set_numbering('font_index', n)
 
 	def _pnstart(self, n: int):
-		self.numbering.start = n
+		self.set_numbering('start', n)
 
 	def _pnindent(self, n: int):
-		self.numbering.indent = n
+		self.set_numbering('indent', n)
 
 	def _pnlvl(self, n: int):
-		self.numbering.level = n
+		self.set_numbering('level', n)
 
 	def _pnlvlbody(self):
 		self._pnlvl(10)
@@ -716,10 +756,10 @@ class Parser:
 		self._pnlvl(11)
 
 	def _pntxtb(self):
-		self.dest = TextSetter(self.numbering, 'before')
+		self.dest = self.numbering_text('before')
 
 	def _pntxta(self):
-		self.dest = TextSetter(self.numbering, 'after')
+		self.dest = self.numbering_text('after')
 
 	def _result(self):
 		# TODO: handle objects?

@@ -123,8 +123,8 @@ class MarkdownOutput(Handler):
 		# Used for destinations like \pntext that carry plain, unformatted text.
 		self._emit(escape_markdown(text))
 
-	def hyperlink(self, text: str, url: str):
-		self._emit(f'[{escape_markdown(text)}]({url})')
+	def hyperlink(self, text: str, args):
+		self._emit(f'[{escape_markdown(text)}]({args.url})')
 
 	def numbering_on(self, info: Numbering):
 		marker = (info.before or '').strip()
