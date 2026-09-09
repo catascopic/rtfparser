@@ -27,7 +27,7 @@ from typing import BinaryIO
 ASCII = 'ascii'
 
 CHARSETS = {
-	'ansi': 'ansi',
+	'ansi': 'cp1252',
 	'pc':   'cp437',
 	'pca':  'cp850',
 	'mac':  'macintosh'
@@ -273,11 +273,11 @@ class Field(Destination):
 		self.result = Text()
 
 	def close(self):
-		name, args = self.instruction.text.split(maxsplit=1)
+		name, *args = self.instruction.text.split(maxsplit=1)
 		parser = rtffields.PARSERS.get(name)
 		if parser is None:
-			raise InstructionError(f"unknown instruction: {name}")
-		getattr(self.delegate, name.lower())(self.result.text, **vars(parser.parse(args)))
+			raise ValueError(f"unknown instruction: {name}")
+		getattr(self.delegate, name.lower())(self.result.text, parser.parse(args[0]) if args else None)
 
 
 class SetValue(Destination, ABC):
@@ -508,9 +508,9 @@ class Parser:
 				end_control(f)
 				# a few control words consume raw bytes from the stream, so they can't go through handle_control.
 				if word == 'u':
-					read_unicode(f, param)
+					self.read_unicode(f, param)
 				elif word == 'bin':
-					read_bin(f, param)
+					self.read_bin(f, param)
 				else:
 					self.handle_control(word, param)
 		else:
@@ -757,10 +757,10 @@ class Output(Destination, ABC):
 	def plain_text(self, text: str):
 		pass
 
-	def hyperlink(self, text, *, url=None):
+	def hyperlink(self, text, args):
 		pass
 
-	def includepicture(self, text, name=None, *, format=None, converter=None, d=None, x=None, y=None):
+	def includepicture(self, text, args):
 		# an INCLUDEPICTURE field, i.e. a reference to an external image.
 		pass
 
@@ -789,7 +789,7 @@ class Handler(Output):
 
 	@property
 	def fonts(self):
-		return self._doc.font_table.fonts
+		return self._doc.fonts
 
 	@property
 	def font(self):
@@ -800,7 +800,7 @@ class Handler(Output):
 
 	@property
 	def colors(self):
-		return self._doc.color_table.colors
+		return self._doc.colors
 
 	@property
 	def color_foreground(self):

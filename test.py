@@ -100,9 +100,10 @@ with open('result.html', 'w', encoding='utf-8') as writer:
 		def numbering_off(self, info):
 			writer.write('</ol>')
 
-		def hyperlink(self, text, url):
-			# TODO: condense hyperlinks?
-			self.current.append(f'<a href="{url}">{text}</a>')
+		def hyperlink(self, text, args):
+			# TODO: condense hyperlinks? They can be spread out across multiple words sometimes.
+			# This is a more general problem that can apply to any kind of styling, though.
+			self.current.append(f'<a href="{args.url}">{text}</a>')
 
 		def end_doc(self):
 			pass
