@@ -245,24 +245,36 @@ class Picture(Destination):
 		self.doc.output.picture(self)
 
 
+class Text(Destination):
+	# a destination whose content is plain text, kept for whoever owns it to read
+
+	def __init__(self):
+		self.content = []
+
+	def write(self, text):
+		self.content.append(text)
+
+	@property
+	def text(self):
+		return ''.join(self.content)
+
+
 class Field(Destination):
 
 	def __init__(self, delegate: Output):
 		self.delegate = delegate
-		self.instruction = ''
-		self.result = ''
-		self.set_instruction = TextSetter(self, 'instruction')
-		self.set_result = TextSetter(self, 'result')
+		self.instruction = Text()
+		self.result = Text()
 
 	def close(self):
-		name, args = rtffields.parse_instruction(self.instruction)
+		name, args = rtffields.parse_instruction(self.instruction.text)
 		if name == 'HYPERLINK':
-			self.delegate.hyperlink(self.result, args.url)
+			self.delegate.hyperlink(self.result.text, args.url)
 		elif name == 'INCLUDEPICTURE':
 			self.delegate.include_picture(args)
 		else:
 			# we have a parser for it, but nowhere to send it yet
-			raise ValueError(f"unhandled instruction: {self.instruction}")
+			raise ValueError(f"unhandled instruction: {self.instruction.text}")
 
 
 class SetValue(Destination, ABC):
@@ -533,6 +545,10 @@ class Parser:
 		# always skip replacement chars
 		self.skip_replacement(f)
 
+	def _read_bin(self, f: BinaryIO, n: Optional[int]):
+		# the next n bytes are raw data rather than rtf. \bin with no param means no data at all
+		self.dest.write_bin(f.read(n or 0))
+
 	def skip_replacement(self, f: BinaryIO):
 		skip_chars(f, self.prop.get('uc', 1))
 
@@ -701,10 +717,6 @@ class Parser:
 	def _pntxta(self):
 		self.dest = TextSetter(self.numbering, 'after')
 
-	def _read_bin(self, f: BinaryIO, n: Optional[int]):
-		# the next n bytes are raw data rather than rtf. \bin with no param means no data at all
-		self.dest.write_bin(f.read(n or 0))
-
 	def _result(self):
 		# TODO: handle objects?
 		self.dest = NULL_DEVICE
@@ -713,10 +725,10 @@ class Parser:
 		self.dest = Field(self.output)
 
 	def _fldinst(self):
-		self.dest = self.dest.set_instruction
+		self.dest = self.dest.instruction
 
 	def _fldrslt(self):
-		self.dest = self.dest.set_result
+		self.dest = self.dest.result
 
 	# PICTURES
 
