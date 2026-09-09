@@ -144,11 +144,3 @@ HYPERLINK.add_argument(r'\o', dest='tip')
 HYPERLINK.add_argument(r'\t', dest='target')
 
 PARSERS = {p.name: p for p in (INCLUDEPICTURE, HYPERLINK)}
-
-
-def parse_instruction(text: str) -> tuple[str, SimpleNamespace]:
-	name, _, rest = text.strip().partition(' ')
-	parser = PARSERS.get(name)
-	if parser is None:
-		raise InstructionError(f"unknown instruction: {name}")
-	return name, parser.parse(rest)

@@ -16,7 +16,7 @@ from typing import BinaryIO
 # This parser makes a questionable, but I believe justified, decision to parse files in binary mode.
 # RTF files are pure ascii, so it sort of doesn't matter. Strings are generally easier to work with in python,
 # but using binary mode lets us call seek() on the reader, which is useful when we want to "peek" at the next token in
-# the stream. (We also get to use bytebuffer a few times and avoid having to do ''.join on lists of chars.)
+# the stream. (We also get to use bytearray a few times and avoid having to do ''.join on lists of chars.)
 # The one awkward part is, in python, characters are 1-char strings, while individual bytes are just ints.
 # We don't want to use ints, because they make the code hard to read, so we instead use byte sequences of length 1.
 # This isn't ideal, but it's really the only downside to this paradigm (other than having to remember to start your
@@ -51,13 +51,13 @@ TOGGLE = frozenset({'b', 'caps', 'deleted', 'i', 'outl', 'scaps', 'shad', 'strik
 CHRFMT = frozenset({
 	'animtext', 'charscalex', 'dn', 'embo', 'impr', 'sub', 'expnd', 'expndtw',
 	'kerning', 'f', 'fs', 'strikedl', 'up', 'super', 'cf', 'cb', 'rtlch',
-	'ltrch', 'cs', 'cchs', 'lang'} | TOGGLE)
+	'ltrch', 'cs', 'cchs', 'lang'
+} | TOGGLE)
 
 # TABS = { ... }
 
 INFO_PROPS = frozenset({'version', 'edmins', 'nofpages', 'nofwords', 'word_count', 'nofchars', 'nofcharsws'})
-TEXT_INFO = frozenset({'title', 'subject', 'author', 'manager', 'company', 'operator',
-                       'category', 'keywords', 'comment', 'doccomm', 'hlinkbase'})
+TEXT_INFO = frozenset({'title', 'subject', 'author', 'manager', 'company', 'operator', 'category', 'keywords', 'comment', 'doccomm', 'hlinkbase'})
 DATE_INFO = frozenset({'creatim', 'revtim', 'printim', 'buptim'})
 NUMBERING_STYLES = frozenset({'pncard', 'pndec', 'pnucltr', 'pnucrm', 'pnlcltr', 'pnlcrm', 'pnord', 'pnordt'})
 
@@ -131,10 +131,16 @@ class PlainText(Destination):
 
 
 class RootDest(Destination):
-	# TODO: in theory this should only allow one write
+	
+	def __init__(self):
+		self.open = True
+	
 	def write(self, text):
+		if not self.open:
+			raise ValueError(f"Root already written but got {text}")
 		if text != '\N{NULL}':
 			raise ValueError(f"expected NULL but got {text}")
+			self.open = False
 
 
 @dataclass(frozen=True)
@@ -176,7 +182,7 @@ class ColorTable(Destination):
 		self.doc = doc
 
 	def write(self, text):
-		# if text != ';': WARN
+		# TODO: if text != ';': WARN
 		self.doc.colors.append(Color(
 			self.doc.prop.get('red', 0),
 			self.doc.prop.get('green', 0),
@@ -217,8 +223,7 @@ class Picture(Destination):
 	def __init__(self, doc: Parser):
 		self.doc = doc
 		self.format = None
-		self.hex = []
-		self.data = None
+		self.data = bytearray()
 		self.width = None  # in the source's own units, which is pixels for bitmaps
 		self.height = None
 		self.goal_width = None  # the size it wants to be displayed at, in twips
@@ -227,14 +232,12 @@ class Picture(Destination):
 		self.scale_y = 100
 
 	def write(self, text):
-		self.hex.append(text)
+		self.data.extend(bytes.fromhex(text))
 
 	def write_bin(self, data: bytes):
-		self.data = data
+		self.data.extend(data)
 
 	def close(self):
-		if self.data is None:
-			self.data = bytes.fromhex(''.join(self.hex))
 		prop = self.doc.prop
 		self.width = prop.get('picw')
 		self.height = prop.get('pich')
@@ -257,6 +260,9 @@ class Text(Destination):
 	@property
 	def text(self):
 		return ''.join(self.content)
+	
+	def __repr__(self):
+		return f"Text<{self.text}>"
 
 
 class Field(Destination):
@@ -267,14 +273,11 @@ class Field(Destination):
 		self.result = Text()
 
 	def close(self):
-		name, args = rtffields.parse_instruction(self.instruction.text)
-		if name == 'HYPERLINK':
-			self.delegate.hyperlink(self.result.text, args.url)
-		elif name == 'INCLUDEPICTURE':
-			self.delegate.include_picture(args)
-		else:
-			# we have a parser for it, but nowhere to send it yet
-			raise ValueError(f"unhandled instruction: {self.instruction.text}")
+		name, args = self.instruction.text.split(maxsplit=1)
+		parser = rtffields.PARSERS.get(name)
+		if parser is None:
+			raise InstructionError(f"unknown instruction: {name}")
+		getattr(self.delegate, name.lower())(self.result.text, **vars(parser.parse(args)))
 
 
 class SetValue(Destination, ABC):
@@ -317,7 +320,6 @@ class TimeSetter(SetValue):
 				*(self.doc.prop.get(k, 0) for k in ('hr', 'min', 'sec'))
 			)
 		except ValueError:
-			# year = 0
 			return None
 
 
@@ -325,7 +327,7 @@ class NullDevice(Destination):
 	# a group we're skipping swallows its whole subtree, so any destination we reach for inside it is null too
 
 	def write(self, text):
-		pass  # do nothing
+		pass
 
 	def write_bin(self, data):
 		pass
@@ -504,10 +506,11 @@ class Parser:
 			else:
 				param = read_number(f)
 				end_control(f)
-				# READER TABLE: a few control words consume raw bytes from the stream, so they can't go through
-				# handle_control, which only knows the vocabulary. They take the reader as their first argument.
-				if reader := getattr(self, '_read_' + word, None):
-					reader(f, param)
+				# a few control words consume raw bytes from the stream, so they can't go through handle_control.
+				if word == 'u':
+					read_unicode(f, param)
+				elif word == 'bin':
+					read_bin(f, param)
 				else:
 					self.handle_control(word, param)
 		else:
@@ -527,7 +530,7 @@ class Parser:
 			else:
 				raise ValueError(f"{c} at {f.tell()}")
 
-	def _read_u(self, f: BinaryIO, param: int):
+	def read_unicode(self, f: BinaryIO, param: int):
 		# rtf params are supposed to be signed 16-bit, so convert to their unsigned value.
 		# but we'll accept larger positive numbers if that's what's on offer
 		unsigned = param if param >= 0 else param + 0x10000
@@ -545,15 +548,16 @@ class Parser:
 		# always skip replacement chars
 		self.skip_replacement(f)
 
-	def _read_bin(self, f: BinaryIO, n: int | None):
+	def read_bin(self, f: BinaryIO, n: int):
 		# the next n bytes are raw data rather than rtf. \bin with no param means no data at all
-		self.dest.write_bin(f.read(n or 0))
+		self.dest.write_bin(f.read(n))
 
 	def skip_replacement(self, f: BinaryIO):
 		skip_chars(f, self.prop.get('uc', 1))
 
 	def handle_control(self, word: str, param: int | None):
 		if instr := getattr(self, '_' + word, None):
+			# TODO: error message if arity doesn't match
 			if param is None:
 				instr()
 			else:
@@ -728,7 +732,7 @@ class Parser:
 		self.dest = self.dest.instruction
 
 	def _fldrslt(self):
-		self.dest = self.dest.set_result
+		self.dest = self.dest.result
 
 	def _pict(self):
 		self.dest = Picture(self)
@@ -753,11 +757,11 @@ class Output(Destination, ABC):
 	def plain_text(self, text: str):
 		pass
 
-	def hyperlink(self, text, url):
+	def hyperlink(self, text, *, url=None):
 		pass
 
-	def include_picture(self, args: SimpleNamespace):
-		# an INCLUDEPICTURE field, i.e. a reference to an external image. args.name is the path
+	def includepicture(self, text, name=None, *, format=None, converter=None, d=None, x=None, y=None):
+		# an INCLUDEPICTURE field, i.e. a reference to an external image.
 		pass
 
 	def picture(self, pic: Picture):
