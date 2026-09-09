@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import os
 import struct
-from collections import deque
 
 import rtfcharset
+import rtffields
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Type, Optional, IO, BinaryIO, Iterable, Callable
+from types import SimpleNamespace
+from typing import BinaryIO
 
 # This parser makes a questionable, but I believe justified, decision to parse files in binary mode.
 # RTF files are pure ascii, so it sort of doesn't matter. Strings are generally easier to work with in python,
@@ -81,7 +83,21 @@ SPECIAL = {
 META_CHARS = frozenset({b'\\', b'{', b'}'})
 
 IGNORE_WORDS = frozenset({'nouicompat', 'viewkind'})
-UNSUPPORTED_DEST = frozenset({'filetbl', 'stylesheet', 'listtables', 'revtbl'})
+# nonshppict is a legacy copy of the picture in the \*\shppict group right before it, so we skip it deliberately
+UNSUPPORTED_DEST = frozenset({'filetbl', 'stylesheet', 'listtables', 'revtbl', 'nonshppict'})
+
+# The blip (binary large image) types a \pict group can declare. Some of these also take a param
+# (a mapping mode or metafile type), which we don't need, since the format alone identifies the data.
+BLIPS = {
+	'pngblip':    'png',
+	'jpegblip':   'jpeg',
+	'emfblip':    'emf',
+	'macpict':    'pict',
+	'wmetafile':  'wmf',
+	'pmmetafile': 'pmf',
+	'dibitmap':   'dib',
+	'wbitmap':    'bmp',
+}
 
 BytePredicate = Callable[[bytes], bool]
 
@@ -90,6 +106,10 @@ class Destination(ABC):
 
 	def write(self, text: str):
 		raise ValueError(f"{type(self)} can't handle text: {text}")
+
+	def write_bin(self, data: bytes):
+		# a destination's content isn't always text: \bin gives us raw bytes, which must not be decoded
+		raise ValueError(f"{type(self)} can't handle {len(data)} bytes of binary data")
 
 	def par(self):
 		raise ValueError(f"{type(self)} can't handle paragraphs")
@@ -121,7 +141,7 @@ class RootDest(Destination):
 class Font:
 	name: str
 	family: str
-	charset: Optional[str] = None
+	charset: str | None = None
 
 
 class FontTable(Destination):
@@ -190,22 +210,71 @@ class Numbering(Destination):
 		self.doc.output.numbering_on(self)
 
 
+class Picture(Destination):
+	# The data is hex by default, or raw bytes if it arrives through \bin. The size properties live in the
+	# group's prop dict like any other property, so we snapshot them on close, while that group is still current.
+
+	def __init__(self, doc: Parser):
+		self.doc = doc
+		self.format = None
+		self.hex = []
+		self.data = None
+		self.width = None  # in the source's own units, which is pixels for bitmaps
+		self.height = None
+		self.goal_width = None  # the size it wants to be displayed at, in twips
+		self.goal_height = None
+		self.scale_x = 100  # percent
+		self.scale_y = 100
+
+	def write(self, text):
+		self.hex.append(text)
+
+	def write_bin(self, data: bytes):
+		self.data = data
+
+	def close(self):
+		if self.data is None:
+			self.data = bytes.fromhex(''.join(self.hex))
+		prop = self.doc.prop
+		self.width = prop.get('picw')
+		self.height = prop.get('pich')
+		self.goal_width = prop.get('picwgoal')
+		self.goal_height = prop.get('pichgoal')
+		self.scale_x = prop.get('picscalex', 100)
+		self.scale_y = prop.get('picscaley', 100)
+		self.doc.output.picture(self)
+
+
+class Text(Destination):
+	# a destination whose content is plain text, kept for whoever owns it to read
+
+	def __init__(self):
+		self.content = []
+
+	def write(self, text):
+		self.content.append(text)
+
+	@property
+	def text(self):
+		return ''.join(self.content)
+
+
 class Field(Destination):
 
 	def __init__(self, delegate: Output):
 		self.delegate = delegate
-		self.instruction = ''
-		self.result = ''
-		self.set_instruction = TextSetter(self, 'instruction')
-		self.set_result = TextSetter(self, 'result')
+		self.instruction = Text()
+		self.result = Text()
 
 	def close(self):
-		instr, *params = self.instruction.split()
-		if instr == 'HYPERLINK':
-			url = params[0].removeprefix('"').removesuffix('"')
-			self.delegate.hyperlink(self.result, url)
+		name, args = rtffields.parse_instruction(self.instruction.text)
+		if name == 'HYPERLINK':
+			self.delegate.hyperlink(self.result.text, args.url)
+		elif name == 'INCLUDEPICTURE':
+			self.delegate.include_picture(args)
 		else:
-			raise ValueError(f"unknown instruction: {self.instruction}")
+			# we have a parser for it, but nowhere to send it yet
+			raise ValueError(f"unhandled instruction: {self.instruction.text}")
 
 
 class SetValue(Destination, ABC):
@@ -253,8 +322,16 @@ class TimeSetter(SetValue):
 
 
 class NullDevice(Destination):
+	# a group we're skipping swallows its whole subtree, so any destination we reach for inside it is null too
+
 	def write(self, text):
 		pass  # do nothing
+
+	def write_bin(self, data):
+		pass
+
+	def __getattr__(self, name):
+		return self
 
 
 NULL_DEVICE = NullDevice()
@@ -262,27 +339,27 @@ NULL_DEVICE = NullDevice()
 
 @dataclass
 class Info:
-	title: str = None
-	subject: str = None
-	author: str = None
-	manager: str = None
-	company: str = None
-	operator: str = None
-	category: str = None
-	keywords: str = None
-	comment: str = None
-	doccomm: str = None
-	hlinkbase: str = None
-	creatim: datetime = None
-	revtim: datetime = None
-	printim: datetime = None
-	buptim: datetime = None
+	title: str | None = None
+	subject: str | None = None
+	author: str | None = None
+	manager: str | None = None
+	company: str | None = None
+	operator: str | None = None
+	category: str | None = None
+	keywords: str | None = None
+	comment: str | None = None
+	doccomm: str | None = None
+	hlinkbase: str | None = None
+	creatim: datetime | None = None
+	revtim: datetime | None = None
+	printim: datetime | None = None
+	buptim: datetime | None = None
 
 
 @dataclass
 class Group:
-	parent: Optional[Group]
-	own_dest: Optional[Destination]
+	parent: Group | None
+	own_dest: Destination | None
 	# TODO: do we want to include string values here?
 	prop: dict[str, str | int | bool]
 
@@ -347,7 +424,7 @@ def read_word(f: BinaryIO):
 	return read_while(f, is_letter).decode(ASCII)
 
 
-def read_number(f, default: Optional[int] = None):
+def read_number(f, default: int | None = None):
 	c = f.read(1)
 	if is_digit(c) or c == b'-':
 		buf = bytearray(c)
@@ -387,16 +464,16 @@ def skip_chars(f: BinaryIO, n: int):
 
 class Parser:
 
-	def __init__(self, output: Type[Recorder]):
+	def __init__(self, output: type[Output]):
 		self.output = output(self)
 		self.group = Group.root()
 		self.rtf_version = 1
-		self.charset: Optional[str] = None
-		self.deff: Optional[int] = None
+		self.charset: str | None = None
+		self.deff: int | None = None
 		self.fonts: dict[int, Font] = {}
 		self.colors: list[Color] = []
 		self.info = Info()
-		self.numbering: Optional[Numbering] = None
+		self.numbering: Numbering | None = None
 
 	def parse(self, file: str | bytes | os.PathLike):
 		with open(file, 'rb') as f:
@@ -427,9 +504,10 @@ class Parser:
 			else:
 				param = read_number(f)
 				end_control(f)
-				# \u is sort of a control word but we handle it separately because it advances the reader
-				if word == 'u':
-					self.read_unicode(f, param)
+				# READER TABLE: a few control words consume raw bytes from the stream, so they can't go through
+				# handle_control, which only knows the vocabulary. They take the reader as their first argument.
+				if reader := getattr(self, '_read_' + word, None):
+					reader(f, param)
 				else:
 					self.handle_control(word, param)
 		else:
@@ -449,7 +527,7 @@ class Parser:
 			else:
 				raise ValueError(f"{c} at {f.tell()}")
 
-	def read_unicode(self, f: BinaryIO, param: int):
+	def _read_u(self, f: BinaryIO, param: int):
 		# rtf params are supposed to be signed 16-bit, so convert to their unsigned value.
 		# but we'll accept larger positive numbers if that's what's on offer
 		unsigned = param if param >= 0 else param + 0x10000
@@ -467,10 +545,14 @@ class Parser:
 		# always skip replacement chars
 		self.skip_replacement(f)
 
+	def _read_bin(self, f: BinaryIO, n: int | None):
+		# the next n bytes are raw data rather than rtf. \bin with no param means no data at all
+		self.dest.write_bin(f.read(n or 0))
+
 	def skip_replacement(self, f: BinaryIO):
 		skip_chars(f, self.prop.get('uc', 1))
 
-	def handle_control(self, word: str, param: Optional[int]):
+	def handle_control(self, word: str, param: int | None):
 		if instr := getattr(self, '_' + word, None):
 			if param is None:
 				instr()
@@ -483,6 +565,9 @@ class Parser:
 
 		if word in TOGGLE:
 			self.toggle(word, param)
+		elif blip := BLIPS.get(word):
+			# this has to come before the prefix matches below, which would otherwise claim \pngblip for numbering
+			self.dest.format = blip
 		elif word.startswith('q'):  # alignment
 			self.prop['q'] = word[1:]
 		elif word.startswith('ul'):
@@ -538,7 +623,10 @@ class Parser:
 
 	@dest.setter
 	def dest(self, value: Destination):
-		self.group.dest = value
+		# once we've decided to skip a group, nothing inside it can open a destination of its own.
+		# this is what makes \nonshppict skip the \pict it wraps, rather than just its text
+		if self.dest is not NULL_DEVICE:
+			self.group.dest = value
 
 	@property
 	def current_font(self):
@@ -629,10 +717,6 @@ class Parser:
 	def _pntxta(self):
 		self.dest = TextSetter(self.numbering, 'after')
 
-	def _bin(self, n: int):
-		# TODO: this and other keywords that take 32-bit integers?
-		pass
-
 	def _result(self):
 		# TODO: handle objects?
 		self.dest = NULL_DEVICE
@@ -641,15 +725,27 @@ class Parser:
 		self.dest = Field(self.output)
 
 	def _fldinst(self):
-		self.dest = self.dest.set_instruction
+		self.dest = self.dest.instruction
 
 	def _fldrslt(self):
 		self.dest = self.dest.set_result
-	
-	def _pngblip(self):
-		"""TODO"""
+
+	def _pict(self):
+		self.dest = Picture(self)
+
+	def _shppict(self):
+		pass  # a transparent wrapper around \pict, so leave the destination to the group inside it
 
 	# TODO: \sect / \sectd
+
+	def _loch(self):
+		"""TODO"""
+	
+	def _hich(self):
+		"""TODO"""
+	
+	def _dbch(self):
+		"""TODO"""
 
 
 class Output(Destination, ABC):
@@ -658,6 +754,14 @@ class Output(Destination, ABC):
 		pass
 
 	def hyperlink(self, text, url):
+		pass
+
+	def include_picture(self, args: SimpleNamespace):
+		# an INCLUDEPICTURE field, i.e. a reference to an external image. args.name is the path
+		pass
+
+	def picture(self, pic: Picture):
+		# an image embedded in the document, as pic.data bytes in pic.format
 		pass
 
 	def numbering_on(self, info: Numbering):

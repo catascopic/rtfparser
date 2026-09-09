@@ -1,3 +1,5 @@
+from collections import deque
+
 from rtfparser import *
 
 # card, ord, and ordt not supported

@@ -1,0 +1,1 @@
+programmatically add blip methods instead of using separate dictionary
