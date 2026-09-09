@@ -645,6 +645,9 @@ class Parser:
 
 	def _fldrslt(self):
 		self.dest = self.dest.set_result
+	
+	def _pngblip(self):
+		"""TODO"""
 
 	# TODO: \sect / \sectd
 
