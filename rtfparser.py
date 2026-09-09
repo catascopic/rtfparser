@@ -473,6 +473,15 @@ def skip_chars(f: BinaryIO, n: int):
 			return
 
 
+def call(self, instr: Callable, param: int | None):
+	# the instruction table is keyed by name alone, so we don't know a word's arity up front
+	# TODO: error message if arity doesn't match
+	if param is None:
+		instr()
+	else:
+		instr(param)
+
+
 class Parser:
 
 	def __init__(self, output: type[Output]):
@@ -564,17 +573,9 @@ class Parser:
 	def skip_replacement(self, f: BinaryIO):
 		skip_chars(f, self.prop.get('uc', 1))
 
-	def call(self, instr: Callable, param: int | None):
-		# the instruction table is keyed by name alone, so we don't know a word's arity up front
-		# TODO: error message if arity doesn't match
-		if param is None:
-			instr()
-		else:
-			instr(param)
-
 	def handle_control(self, word: str, param: int | None):
 		if instr := getattr(self, '_' + word, None):
-			self.call(instr, param)
+			call(instr, param)
 			return
 
 		if param is None:
@@ -631,7 +632,7 @@ class Parser:
 		param = read_number(f)
 		end_control(f)
 		if instr := getattr(self, '_' + word, None):
-			self.call(instr, param)
+			call(instr, param)
 		else:
 			self.dest = NULL_DEVICE
 
@@ -653,8 +654,7 @@ class Parser:
 	def get_font(self, index: int | None) -> Font:
 		# documents reference fonts they never put in the table, and \deff can be missing entirely.
 		# a font only steers decoding and styling, so a stand-in beats aborting the whole parse.
-		font = self.fonts.get(index)
-		return DEFAULT_FONT if font is None else font
+		return self.fonts.get(index, DEFAULT_FONT)
 
 	@property
 	def current_font(self) -> Font:

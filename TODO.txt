@@ -1,1 +1,3 @@
 programmatically add blip methods instead of using separate dictionary
+
+I'm not sure I like the __getattr__ hack in NullDevice. What would be a good alternative?
