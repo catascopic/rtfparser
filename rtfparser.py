@@ -83,7 +83,21 @@ SPECIAL = {
 META_CHARS = frozenset({b'\\', b'{', b'}'})
 
 IGNORE_WORDS = frozenset({'nouicompat', 'viewkind'})
-UNSUPPORTED_DEST = frozenset({'filetbl', 'stylesheet', 'listtables', 'revtbl'})
+# nonshppict is a legacy copy of the picture in the \*\shppict group right before it, so we skip it deliberately
+UNSUPPORTED_DEST = frozenset({'filetbl', 'stylesheet', 'listtables', 'revtbl', 'nonshppict'})
+
+# The blip (binary large image) types a \pict group can declare. Some of these also take a param
+# (a mapping mode or metafile type), which we don't need, since the format alone identifies the data.
+BLIPS = {
+	'pngblip':    'png',
+	'jpegblip':   'jpeg',
+	'emfblip':    'emf',
+	'macpict':    'pict',
+	'wmetafile':  'wmf',
+	'pmmetafile': 'pmf',
+	'dibitmap':   'dib',
+	'wbitmap':    'bmp',
+}
 
 BytePredicate = Callable[[bytes], bool]
 
@@ -92,6 +106,10 @@ class Destination(ABC):
 
 	def write(self, text: str):
 		raise ValueError(f"{type(self)} can't handle text: {text}")
+
+	def write_bin(self, data: bytes):
+		# a destination's content isn't always text: \bin gives us raw bytes, which must not be decoded
+		raise ValueError(f"{type(self)} can't handle {len(data)} bytes of binary data")
 
 	def par(self):
 		raise ValueError(f"{type(self)} can't handle paragraphs")
@@ -192,6 +210,41 @@ class Numbering(Destination):
 		self.doc.output.numbering_on(self)
 
 
+class Picture(Destination):
+	# The data is hex by default, or raw bytes if it arrives through \bin. The size properties live in the
+	# group's prop dict like any other property, so we snapshot them on close, while that group is still current.
+
+	def __init__(self, doc: Parser):
+		self.doc = doc
+		self.format = None
+		self.hex = []
+		self.data = None
+		self.width = None  # in the source's own units, which is pixels for bitmaps
+		self.height = None
+		self.goal_width = None  # the size it wants to be displayed at, in twips
+		self.goal_height = None
+		self.scale_x = 100  # percent
+		self.scale_y = 100
+
+	def write(self, text):
+		self.hex.append(text)
+
+	def write_bin(self, data: bytes):
+		self.data = data
+
+	def close(self):
+		if self.data is None:
+			self.data = bytes.fromhex(''.join(self.hex))
+		prop = self.doc.prop
+		self.width = prop.get('picw')
+		self.height = prop.get('pich')
+		self.goal_width = prop.get('picwgoal')
+		self.goal_height = prop.get('pichgoal')
+		self.scale_x = prop.get('picscalex', 100)
+		self.scale_y = prop.get('picscaley', 100)
+		self.doc.output.picture(self)
+
+
 class Field(Destination):
 
 	def __init__(self, delegate: Output):
@@ -257,8 +310,16 @@ class TimeSetter(SetValue):
 
 
 class NullDevice(Destination):
+	# a group we're skipping swallows its whole subtree, so any destination we reach for inside it is null too
+
 	def write(self, text):
 		pass  # do nothing
+
+	def write_bin(self, data):
+		pass
+
+	def __getattr__(self, name):
+		return self
 
 
 NULL_DEVICE = NullDevice()
@@ -391,7 +452,7 @@ def skip_chars(f: BinaryIO, n: int):
 
 class Parser:
 
-	def __init__(self, output: Type[Recorder]):
+	def __init__(self, output: Type[Output]):
 		self.output = output(self)
 		self.group = Group.root()
 		self.rtf_version = 1
@@ -431,9 +492,10 @@ class Parser:
 			else:
 				param = read_number(f)
 				end_control(f)
-				# \u is sort of a control word but we handle it separately because it advances the reader
-				if word == 'u':
-					self.read_unicode(f, param)
+				# READER TABLE: a few control words consume raw bytes from the stream, so they can't go through
+				# handle_control, which only knows the vocabulary. They take the reader as their first argument.
+				if reader := getattr(self, '_read_' + word, None):
+					reader(f, param)
 				else:
 					self.handle_control(word, param)
 		else:
@@ -453,7 +515,7 @@ class Parser:
 			else:
 				raise ValueError(f"{c} at {f.tell()}")
 
-	def read_unicode(self, f: BinaryIO, param: int):
+	def _read_u(self, f: BinaryIO, param: int):
 		# rtf params are supposed to be signed 16-bit, so convert to their unsigned value.
 		# but we'll accept larger positive numbers if that's what's on offer
 		unsigned = param if param >= 0 else param + 0x10000
@@ -487,6 +549,9 @@ class Parser:
 
 		if word in TOGGLE:
 			self.toggle(word, param)
+		elif blip := BLIPS.get(word):
+			# this has to come before the prefix matches below, which would otherwise claim \pngblip for numbering
+			self.dest.format = blip
 		elif word.startswith('q'):  # alignment
 			self.prop['q'] = word[1:]
 		elif word.startswith('ul'):
@@ -542,7 +607,10 @@ class Parser:
 
 	@dest.setter
 	def dest(self, value: Destination):
-		self.group.dest = value
+		# once we've decided to skip a group, nothing inside it can open a destination of its own.
+		# this is what makes \nonshppict skip the \pict it wraps, rather than just its text
+		if self.dest is not NULL_DEVICE:
+			self.group.dest = value
 
 	@property
 	def current_font(self):
@@ -633,9 +701,9 @@ class Parser:
 	def _pntxta(self):
 		self.dest = TextSetter(self.numbering, 'after')
 
-	def _bin(self, n: int):
-		# TODO: this and other keywords that take 32-bit integers?
-		pass
+	def _read_bin(self, f: BinaryIO, n: Optional[int]):
+		# the next n bytes are raw data rather than rtf. \bin with no param means no data at all
+		self.dest.write_bin(f.read(n or 0))
 
 	def _result(self):
 		# TODO: handle objects?
@@ -649,9 +717,14 @@ class Parser:
 
 	def _fldrslt(self):
 		self.dest = self.dest.set_result
-	
-	def _pngblip(self):
-		"""TODO"""
+
+	# PICTURES
+
+	def _pict(self):
+		self.dest = Picture(self)
+
+	def _shppict(self):
+		pass  # a transparent wrapper around \pict, so leave the destination to the group inside it
 
 	# TODO: \sect / \sectd
 
@@ -666,6 +739,10 @@ class Output(Destination, ABC):
 
 	def include_picture(self, args: SimpleNamespace):
 		# an INCLUDEPICTURE field, i.e. a reference to an external image. args.name is the path
+		pass
+
+	def picture(self, pic: Picture):
+		# an image embedded in the document, as pic.data bytes in pic.format
 		pass
 
 	def numbering_on(self, info: Numbering):
