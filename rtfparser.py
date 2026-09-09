@@ -5,10 +5,12 @@ import struct
 from collections import deque
 
 import rtfcharset
+import rtffields
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Type, Optional, IO, BinaryIO, Iterable, Callable
 
 # This parser makes a questionable, but I believe justified, decision to parse files in binary mode.
@@ -200,12 +202,14 @@ class Field(Destination):
 		self.set_result = TextSetter(self, 'result')
 
 	def close(self):
-		instr, *params = self.instruction.split()
-		if instr == 'HYPERLINK':
-			url = params[0].removeprefix('"').removesuffix('"')
-			self.delegate.hyperlink(self.result, url)
+		name, args = rtffields.parse_instruction(self.instruction)
+		if name == 'HYPERLINK':
+			self.delegate.hyperlink(self.result, args.url)
+		elif name == 'INCLUDEPICTURE':
+			self.delegate.include_picture(args)
 		else:
-			raise ValueError(f"unknown instruction: {self.instruction}")
+			# we have a parser for it, but nowhere to send it yet
+			raise ValueError(f"unhandled instruction: {self.instruction}")
 
 
 class SetValue(Destination, ABC):
@@ -658,6 +662,10 @@ class Output(Destination, ABC):
 		pass
 
 	def hyperlink(self, text, url):
+		pass
+
+	def include_picture(self, args: SimpleNamespace):
+		# an INCLUDEPICTURE field, i.e. a reference to an external image. args.name is the path
 		pass
 
 	def numbering_on(self, info: Numbering):
