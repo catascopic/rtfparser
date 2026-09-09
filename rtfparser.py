@@ -102,6 +102,17 @@ BLIPS = {
 BytePredicate = Callable[[bytes], bool]
 
 
+class RtfWarning(ValueError):
+	# something the file did that we don't model or didn't expect. Reported through Output.warning
+	# normally, raised when the parser is strict. Subclasses ValueError to match the rest of the
+	# parser's errors -- it has nothing to do with the stdlib warnings module.
+
+	def __init__(self, message: str, position: int | None = None):
+		super().__init__(message if position is None else f"{message} at {position}")
+		self.message = message
+		self.position = position
+
+
 class Destination(ABC):
 
 	def write(self, text: str):
@@ -109,7 +120,7 @@ class Destination(ABC):
 
 	def write_bin(self, data: bytes):
 		# a destination's content isn't always text: \bin gives us raw bytes, which must not be decoded
-		raise ValueError(f"{type(self)} can't handle {len(data)} bytes of binary data")
+		raise ValueError(f"{type(self)} can't handle binary data: {len(data)} bytes")
 
 	def par(self):
 		raise ValueError(f"{type(self)} can't handle paragraphs")
@@ -164,10 +175,12 @@ class FontTable(Destination):
 	def write(self, text):
 		self.name.append(text)
 		if text.endswith(';'):
-			self.doc.fonts[self.doc.prop['f']] = Font(
-				''.join(self.name)[:-1],
-				self.doc.prop['family'],
-				self.doc.prop.get('fcharset'))
+			name = ''.join(self.name)[:-1]
+			charset = self.doc.prop.get('fcharset')
+			# checked here, where a font is defined once, rather than at every \'hh that uses it
+			if charset is not None and charset not in rtfcharset.CHARSETS:
+				self.doc.warn(f"unknown charset {charset} for font {name!r}")
+			self.doc.fonts[self.doc.prop['f']] = Font(name, self.doc.prop['family'], charset)
 			self.name = []
 
 
@@ -187,7 +200,8 @@ class ColorTable(Destination):
 		self.doc = doc
 
 	def write(self, text):
-		# TODO: if text != ';': WARN
+		if text != ';':
+			self.doc.warn(f"unexpected text in color table: {text!r}")
 		self.doc.colors.append(Color(
 			self.doc.prop.get('red', 0),
 			self.doc.prop.get('green', 0),
@@ -272,21 +286,25 @@ class Text(Destination):
 
 class Field(Destination):
 
-	def __init__(self, delegate: Output):
+	def __init__(self, doc: Parser, delegate: Output):
+		self.doc = doc
 		self.delegate = delegate
 		self.instruction = Text()
 		self.result = Text()
 
 	def close(self):
-		name, *args = self.instruction.text.split(maxsplit=1)
-		if args:
-			parser = rtffields.PARSERS.get(name)
-			if parser is None:
-				raise ValueError(f"unknown instruction: {name}")
-			result = parser.parse(args)
-		else:
-			result = None
-		getattr(self.delegate, name.lower())(self.result.text, result)
+		name, _, args = self.instruction.text.strip().partition(' ')
+		parser = rtffields.PARSERS.get(name)
+		handler = getattr(self.delegate, name.lower(), None) if name else None
+		if parser is None or handler is None:
+			# a field type we don't model -- PAGE, DATE and TOC are all over real documents.
+			# its result is whatever the writer last rendered for it, which is the best thing
+			# we have to show, so pass that through as ordinary text rather than dropping it.
+			self.doc.warn(f"unsupported field instruction: {name or '(empty)'}")
+			if self.result.text:
+				self.delegate.write(self.result.text)
+			return
+		handler(self.result.text, parser.parse(args))
 
 
 class SetValue(Destination, ABC):
@@ -333,7 +351,6 @@ class TimeSetter(SetValue):
 
 
 class NullDevice(Destination):
-	# a group we're skipping swallows its whole subtree, so any destination we reach for inside it is null too
 
 	def write(self, text):
 		pass
@@ -341,8 +358,22 @@ class NullDevice(Destination):
 	def write_bin(self, data):
 		pass
 
+	def par(self):
+		pass
+
+	def page_break(self):
+		pass
+
+	def close(self):
+		pass
+
 	def __getattr__(self, name):
+		# any miscellaneous property is assumed to be a sub-destination
 		return self
+
+	def __setattr__(self, name, value):
+		# ignores setting special properties, like `format` for pictures
+		pass
 
 
 NULL_DEVICE = NullDevice()
@@ -473,7 +504,7 @@ def skip_chars(f: BinaryIO, n: int):
 			return
 
 
-def call(self, instr: Callable, param: int | None):
+def call(instr: Callable, param: int | None):
 	# the instruction table is keyed by name alone, so we don't know a word's arity up front
 	# TODO: error message if arity doesn't match
 	if param is None:
@@ -484,8 +515,12 @@ def call(self, instr: Callable, param: int | None):
 
 class Parser:
 
-	def __init__(self, output: type[Output]):
+	def __init__(self, output: type[Output], strict: bool = False):
 		self.output = output(self)
+		# strict turns every warning into an RtfWarning, which is how you find out what a corpus
+		# contains that this parser doesn't model. Leave it off to read documents in the wild.
+		self.strict = strict
+		self.file: BinaryIO | None = None
 		self.group = Group.root()
 		self.rtf_version = 1
 		self.charset: str | None = None
@@ -497,23 +532,30 @@ class Parser:
 
 	def parse(self, file: str | bytes | os.PathLike):
 		with open(file, 'rb') as f:
-			# TODO: try/except with f.tell()?
-			while True:
-				text = read_while(f, not_control).translate(None, b'\r\n').decode(ASCII)
-				if text:
-					self.dest.write(text)
-				c = f.read(1)
-				if c == b'\\':
-					self.read_control(f)
-				elif c == b'{':
-					self.group = self.group.open()
-				elif c == b'}':
-					self.group = self.group.close()
-				elif c == b'':
-					self.output.end_doc()
-					break
-				else:
-					raise ValueError(f"illegal char: {c} at {f.tell()}")
+			# kept on the parser so warnings raised deep in a destination can still say where we are
+			self.file = f
+			try:
+				self.read_all(f)
+			finally:
+				self.file = None
+
+	def read_all(self, f: BinaryIO):
+		while True:
+			text = read_while(f, not_control).translate(None, b'\r\n').decode(ASCII)
+			if text:
+				self.dest.write(text)
+			c = f.read(1)
+			if c == b'\\':
+				self.read_control(f)
+			elif c == b'{':
+				self.group = self.group.open()
+			elif c == b'}':
+				self.group = self.group.close()
+			elif c == b'':
+				self.output.end_doc()
+				break
+			else:
+				raise ValueError(f"illegal char: {c} at {f.tell()}")
 
 	def read_control(self, f: BinaryIO):
 		word = read_word(f)
@@ -637,6 +679,18 @@ class Parser:
 			self.dest = NULL_DEVICE
 
 	@property
+	def position(self) -> int | None:
+		# how far we've read, which is just past the construct being complained about,
+		# since its control word has already been consumed
+		return None if self.file is None else self.file.tell()
+
+	def warn(self, message: str):
+		# the one funnel for "the file did something we don't model or didn't expect"
+		if self.strict:
+			raise RtfWarning(message, self.position)
+		self.output.warning(message, self.position)
+
+	@property
 	def prop(self):
 		return self.group.prop
 
@@ -731,11 +785,22 @@ class Parser:
 	def set_numbering(self, attr: str, value):
 		if self.numbering is not None:
 			setattr(self.numbering, attr, value)
+		else:
+			self.warn_stray_numbering(attr)
 
 	def numbering_text(self, attr: str) -> Destination:
 		if self.numbering is None:
+			self.warn_stray_numbering(attr)
 			return NULL_DEVICE
 		return TextSetter(self.numbering, attr)
+
+	def warn_stray_numbering(self, attr: str):
+		# inside a destination we're skipping ({\*\pnseclvl3 ...} and friends) this is expected and
+		# not worth reporting. Out here it means the file put a \pn word somewhere it doesn't belong.
+		# We only have the property name here, not the control word that set it -- the \pn* methods
+		# are dispatched by name, so the word itself is gone by the time we get called.
+		if self.dest is not NULL_DEVICE:
+			self.warn(f"numbering property set outside a numbering group: {attr}")
 
 	def _pnf(self, n: int):
 		self.set_numbering('font_index', n)
@@ -766,7 +831,7 @@ class Parser:
 		self.dest = NULL_DEVICE
 
 	def _field(self):
-		self.dest = Field(self.output)
+		self.dest = Field(self, self.output)
 
 	def _fldinst(self):
 		self.dest = self.dest.instruction
@@ -795,6 +860,11 @@ class Parser:
 class Output(Destination, ABC):
 
 	def plain_text(self, text: str):
+		pass
+
+	def warning(self, message: str, position: int | None = None):
+		# the document did something we don't model. Override to collect or report these;
+		# pass strict=True to Parser to have them raised instead.
 		pass
 
 	def hyperlink(self, text, args):
