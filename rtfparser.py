@@ -85,7 +85,16 @@ META_CHARS = frozenset({b'\\', b'{', b'}'})
 
 IGNORE_WORDS = frozenset({'nouicompat', 'viewkind'})
 # nonshppict is a legacy copy of the picture in the \*\shppict group right before it, so we skip it deliberately
-UNSUPPORTED_DEST = frozenset({'filetbl', 'stylesheet', 'listtables', 'revtbl', 'nonshppict'})
+# These carry text that isn't body text. None of them are \* destinations, so without naming them
+# here their content flows straight into whatever destination encloses them -- a page header ends up
+# inlined in the first paragraph. Footnotes belong in the output eventually, but silently running
+# them together with the body is worse than dropping them.
+UNSUPPORTED_DEST = frozenset({
+	'filetbl', 'stylesheet', 'listtables', 'revtbl', 'nonshppict',
+	'header', 'headerl', 'headerr', 'headerf',
+	'footer', 'footerl', 'footerr', 'footerf',
+	'footnote',
+})
 
 # The blip (binary large image) types a \pict group can declare. Some of these also take a param
 # (a mapping mode or metafile type), which we don't need, since the format alone identifies the data.
@@ -517,7 +526,6 @@ def call(instr: Callable, param: int | None):
 class Parser:
 
 	def __init__(self, output: type[Output], strict: bool = False):
-		self.output = output(self)
 		# strict turns every warning into an RtfWarning, which is how you find out what a corpus
 		# contains that this parser doesn't model. Leave it off to read documents in the wild.
 		self.strict = strict
@@ -530,6 +538,9 @@ class Parser:
 		self.colors: list[Color] = []
 		self.info = Info()
 		self.numbering: Numbering | None = None
+		# built last: it gets a reference to us, and an Output that reads doc.info or doc.fonts in
+		# its constructor should find them there rather than a half-initialised parser
+		self.output = output(self)
 
 	def parse(self, file: str | bytes | os.PathLike):
 		with open(file, 'rb') as f:
