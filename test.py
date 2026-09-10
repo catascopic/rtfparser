@@ -33,8 +33,7 @@ with open('result.html', 'w', encoding='utf-8') as writer:
 
 	class Recorder(Handler):
 
-		def __init__(self, doc):
-			super().__init__(doc)
+		def __init__(self):
 			self.paragraphs = []
 			self.current = []
 			self.last_prop = {}
@@ -108,5 +107,5 @@ with open('result.html', 'w', encoding='utf-8') as writer:
 		def end_doc(self):
 			pass
 
-	rtf = Parser(Recorder)
+	rtf = Parser(Recorder())
 	rtf.parse('imagetest.rtf')

@@ -525,7 +525,7 @@ def call(instr: Callable, param: int | None):
 
 class Parser:
 
-	def __init__(self, output: type[Output], strict: bool = False):
+	def __init__(self, output: Output, strict: bool = False):
 		# strict turns every warning into an RtfWarning, which is how you find out what a corpus
 		# contains that this parser doesn't model. Leave it off to read documents in the wild.
 		self.strict = strict
@@ -538,9 +538,7 @@ class Parser:
 		self.colors: list[Color] = []
 		self.info = Info()
 		self.numbering: Numbering | None = None
-		# built last: it gets a reference to us, and an Output that reads doc.info or doc.fonts in
-		# its constructor should find them there rather than a half-initialised parser
-		self.output = output(self)
+		self.output = output
 
 	def parse(self, file: str | bytes | os.PathLike):
 		with open(file, 'rb') as f:
@@ -556,6 +554,7 @@ class Parser:
 			raise ValueError(f"{f} is not seekable")
 		if isinstance(f.read(0), str):
 			raise ValueError(f"{f} is not open in binary mode")
+		self.output.begin_doc(self)
 		self.file = f
 		try:
 			self.read_all(f)
@@ -882,8 +881,16 @@ class Parser:
 
 class Output(Destination, ABC):
 
-	def __init__(self, doc: Parser):
-		# every Output is built by the parser, with the parser -- see Parser.__init__
+	# bound when a parse starts rather than injected at construction, so an Output is an ordinary
+	# object its author can give a constructor of their own. A class attribute, so an unbound
+	# instance is still valid -- and so begin_doc can tell a fresh one from a spent one.
+	_doc: Parser | None = None
+
+	def begin_doc(self, doc: Parser):
+		# an Output accumulates one document's results, so binding it twice would silently merge
+		# two documents the way reusing a Parser used to
+		if self._doc is not None:
+			raise ValueError(f"{type(self).__name__} has already read a document; use a new one")
 		self._doc = doc
 
 	def warn(self, message: str):
@@ -982,26 +989,26 @@ class Handler(Output):
 
 
 # The way in. A Parser reads exactly one document and its Output accumulates the results, so these
-# hand back the Output rather than the Parser -- there's nothing useful to do with a spent one, and
-# reusing it would silently merge two documents. Parser stays public for anyone who wants the parse
-# state itself, but nobody has to know it exists to read a file.
+# hand back the Output you gave them rather than the Parser -- there's nothing useful to do with a
+# spent parser, and reusing one would silently merge two documents. Parser stays public for anyone
+# who wants the parse state itself, but nobody has to know it exists to read a file.
 
 OutputType = TypeVar('OutputType', bound=Output)
 
 
-def parse(file: str | bytes | os.PathLike, output: type[OutputType], *, strict: bool = False) -> OutputType:
+def parse(file: str | bytes | os.PathLike, output: OutputType, *, strict: bool = False) -> OutputType:
 	doc = Parser(output, strict)
 	doc.parse(file)
 	return doc.output
 
 
-def parse_bytes(data: bytes, output: type[OutputType], *, strict: bool = False) -> OutputType:
+def parse_bytes(data: bytes, output: OutputType, *, strict: bool = False) -> OutputType:
 	doc = Parser(output, strict)
 	doc.parse_bytes(data)
 	return doc.output
 
 
-def parse_stream(f: BinaryIO, output: type[OutputType], *, strict: bool = False) -> OutputType:
+def parse_stream(f: BinaryIO, output: OutputType, *, strict: bool = False) -> OutputType:
 	doc = Parser(output, strict)
 	doc.parse_stream(f)
 	return doc.output

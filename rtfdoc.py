@@ -180,9 +180,8 @@ class Document:
 
 class DocumentBuilder(Handler):
 
-	def __init__(self, doc):
-		super().__init__(doc)
-		self.document = Document(doc.info)
+	def __init__(self):
+		self.document = Document(Info())
 		self.content: list[Inline] = []
 		self.marker: list[str] = []
 		self.current_list: Numbering | None = None
@@ -292,12 +291,12 @@ class DocumentBuilder(Handler):
 
 
 def read(file: str | bytes | os.PathLike, *, strict: bool = False) -> Document:
-	return rtfparser.parse(file, DocumentBuilder, strict=strict).document
+	return rtfparser.parse(file, DocumentBuilder(), strict=strict).document
 
 
 def read_bytes(data: bytes, *, strict: bool = False) -> Document:
-	return rtfparser.parse_bytes(data, DocumentBuilder, strict=strict).document
+	return rtfparser.parse_bytes(data, DocumentBuilder(), strict=strict).document
 
 
 def read_stream(f: BinaryIO, *, strict: bool = False) -> Document:
-	return rtfparser.parse_stream(f, DocumentBuilder, strict=strict).document
+	return rtfparser.parse_stream(f, DocumentBuilder(), strict=strict).document

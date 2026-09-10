@@ -51,8 +51,7 @@ class MarkdownOutput(Handler):
 	document as Markdown text.
 	"""
 
-	def __init__(self, doc):
-		super().__init__(doc)
+	def __init__(self):
 		self.parts: list[str] = []
 		self._list_prefix: str | None = None
 		self._list_indent: int = 0
@@ -156,7 +155,7 @@ class MarkdownOutput(Handler):
 
 
 def convert(rtf_path: str | Path) -> str:
-	return rtfparser.parse(rtf_path, MarkdownOutput).markdown
+	return rtfparser.parse(rtf_path, MarkdownOutput()).markdown
 
 
 def main():
