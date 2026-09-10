@@ -18,7 +18,7 @@ sys.path.insert(0, ROOT)
 import rtfcharset
 import rtfparser
 
-from rtfparser import Destination, Handler, NullDevice, NULL_DEVICE, Parser, RtfWarning
+from rtfparser import Destination, Handler, NullDevice, NULL_DEVICE, Output, Parser, RtfWarning
 
 # a minimal but complete preamble, so each case only has to supply the part under test
 HEADER = rb"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fnil Arial;}}"
@@ -367,6 +367,77 @@ class TestStreamGuards(unittest.TestCase):
 		with self.assertRaises(ValueError) as caught:
 			doc.parse_bytes(b'{\\rtf1}')
 		self.assertIn('already', str(caught.exception))
+
+
+class TestHandlerAccessors(unittest.TestCase):
+
+	def test_underline_reads_the_property_the_parser_sets(self):
+		# Handler.underline read 'u', but \ul stores under 'ul', so it was always False
+		seen = []
+
+		class UL(Recorder):
+			def write(self, text):
+				super().write(text)
+				seen.append((text, self.underline))
+
+		rtfparser.parse_bytes(HEADER + rb"\f0 plain\ul under\ulnone after}", UL)
+		self.assertEqual(seen, [('plain', False), ('under', True), ('after', False)])
+
+	def test_underline_variants_are_reported(self):
+		seen = []
+
+		class UL(Recorder):
+			def write(self, text):
+				super().write(text)
+				seen.append(self.underline)
+
+		rtfparser.parse_bytes(HEADER + rb"\f0\uldb double}", UL)
+		self.assertEqual(seen, ['db'])
+
+	def test_an_output_can_warn(self):
+		class Noisy(Recorder):
+			def par(self):
+				self.warn("a paragraph I did not care for")
+
+		out = rtfparser.parse_bytes(HEADER + rb"\f0 x\par}", Noisy)
+		self.assertIn('did not care for', out.warnings[0])
+		self.assertIsInstance(out.positions[0], int)
+
+	def test_an_output_warning_obeys_strict(self):
+		class Noisy(Recorder):
+			def par(self):
+				self.warn("nope")
+
+		with self.assertRaises(RtfWarning):
+			rtfparser.parse_bytes(HEADER + rb"\f0 x\par}", Noisy, strict=True)
+
+	def test_a_bare_output_subclass_needs_no_constructor(self):
+		# Output had no __init__, so subclassing it directly raised
+		# "TypeError: Bare() takes no arguments" when the parser built it
+		written = []
+
+		class Bare(Output):
+			def write(self, text):
+				written.append(text)
+
+			def par(self):
+				pass
+
+		rtfparser.parse_bytes(HEADER + rb"\f0 hello}", Bare)
+		self.assertEqual(written, ['hello'])
+
+	def test_numbering_font_needs_no_parser_argument(self):
+		# Numbering already holds its doc, so asking the handler for a Parser to pass
+		# back in was the only thing forcing a numbering_on handler to reach for _doc
+		fonts = []
+
+		class Lists(Recorder):
+			def numbering_on(self, info):
+				super().numbering_on(info)
+				fonts.append(info.font().name)
+
+		rtfparser.parse_bytes(HEADER + rb"{\*\pn\pnlvlblt\pndec{\pntxtb -}}\pard x\par}", Lists)
+		self.assertEqual(fonts, ['Arial'])
 
 
 class TestSampleDocuments(unittest.TestCase):

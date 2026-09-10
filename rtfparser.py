@@ -226,11 +226,11 @@ class Numbering(Destination):
 		self.start = 1
 
 	# TODO: move this somewhere else?
-	def font(self, doc: Parser):
+	def font(self):
 		index = self.font_index
 		if index is None:
-			index = doc.prop.get('f', doc.deff)
-		return doc.get_font(index)
+			index = self.doc.prop.get('f', self.doc.deff)
+		return self.doc.get_font(index)
 
 	def close(self):
 		self.doc.output.numbering_on(self)
@@ -871,6 +871,15 @@ class Parser:
 
 class Output(Destination, ABC):
 
+	def __init__(self, doc: Parser):
+		# every Output is built by the parser, with the parser -- see Parser.__init__
+		self._doc = doc
+
+	def warn(self, message: str):
+		# report a problem of our own through the parser's warning channel, so it obeys
+		# strict mode and picks up a byte offset like any other warning
+		self._doc.warn(message)
+
 	def plain_text(self, text: str):
 		pass
 
@@ -901,9 +910,6 @@ class Output(Destination, ABC):
 
 
 class Handler(Output):
-
-	def __init__(self, doc):
-		self._doc = doc
 
 	@property
 	def prop(self):
@@ -947,7 +953,8 @@ class Handler(Output):
 
 	@property
 	def underline(self):
-		return self.prop.get('u', False)
+		# \ul sets 'ul'; \uldb and friends put their variant there as a string
+		return self.prop.get('ul', False)
 
 	@property
 	def alignment(self):
